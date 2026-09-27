@@ -216,7 +216,8 @@ BEGIN
             USING HINT = 'Use schema.table. The table ends in _q and has at most 47 characters from A-Z, a-z, 0-9, _ and -.';
     END IF;
     IF NOT has_schema_privilege(owner_name, s, 'CREATE') THEN
-        RAISE EXCEPTION 'topic.create_topic: role % has no CREATE privilege on schema %', owner_name, s;
+        RAISE EXCEPTION 'topic.create_topic: role % has no CREATE privilege on schema %', owner_name, s
+            USING ERRCODE = '42501';
     END IF;
     IF min_durability IN ('durable', 'replicated') AND NOT current_setting('pg_topics.failover_is_fenced')::bool THEN
         RAISE EXCEPTION 'topic.create_topic: min_durability % needs pg_topics.failover_is_fenced = on', min_durability;
@@ -1261,6 +1262,51 @@ BEGIN
     END LOOP;
 EXCEPTION WHEN OTHERS THEN
     RAISE WARNING 'topic: the % event trigger failed on %: %', TG_EVENT, TG_TAG, SQLERRM;
+END
+$$;
+
+CREATE FUNCTION topic.describe_configs(topic text)
+RETURNS TABLE (name text, value text, editable boolean)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    q record;
+    c topic.topic_config;
+BEGIN
+    SELECT * INTO q FROM topic.owned_topic(describe_configs.topic);
+    SELECT * INTO c FROM topic.topic_config t WHERE t.schema_name = q.schema_name AND t.topic = q.topic_name;
+    RETURN QUERY VALUES
+        ('retention.ms', (extract(epoch FROM c.retention_interval) * 1000)::bigint::text, true),
+        ('cleanup.policy', 'delete', false),
+        ('message.timestamp.type', 'LogAppendTime', false),
+        ('max.message.bytes', current_setting('pg_topics.max_message_bytes'), false),
+        ('pg_topics.min_durability', c.min_durability, true);
+END
+$$;
+
+CREATE FUNCTION topic.describe_group(group_name text)
+RETURNS TABLE (found boolean, state text, protocol_type text, protocol_name text,
+               member_id text, client_id text, metadata bytea, assignment bytea)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    g topic.topic_groups;
+BEGIN
+    SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = describe_group.group_name;
+    IF NOT FOUND OR NOT pg_has_role(topic.caller(), g.owner_role, 'member') THEN
+        RETURN QUERY SELECT false, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::bytea, NULL::bytea;
+        RETURN;
+    END IF;
+    RETURN QUERY
+    SELECT true, g.state, g.protocol_type, g.protocol_name, m.member_id, m.client_id,
+           topic.wire_bytes((SELECT p.value -> 'metadata' FROM jsonb_array_elements(m.protocols) p(value)
+                             WHERE p.value ->> 'name' = g.protocol_name)),
+           topic.wire_bytes(m.assignment)
+    FROM topic.topic_group_members m WHERE m.group_name = g.group_name;
+    IF NOT FOUND THEN
+        RETURN QUERY SELECT true, g.state, g.protocol_type, g.protocol_name,
+                            NULL::text, NULL::text, NULL::bytea, NULL::bytea;
+    END IF;
 END
 $$;
 

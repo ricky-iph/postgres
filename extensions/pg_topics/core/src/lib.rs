@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod batch;
 pub mod groups;
 pub mod handlers;

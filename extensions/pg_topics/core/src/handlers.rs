@@ -148,6 +148,13 @@ pub fn authenticate(pg_port: u16, database: &str, auth_bytes: &[u8]) -> Result<C
     }
 }
 
+pub(crate) fn cluster_id(db: &mut Client) -> Result<String, Error> {
+    let id: i64 = db
+        .query_one("SELECT system_identifier FROM pg_control_system()", &[])?
+        .try_get(0)?;
+    Ok(id.to_string())
+}
+
 pub fn metadata(
     db: &mut Client,
     host: &str,
@@ -213,7 +220,7 @@ pub fn metadata(
             .with_node_id(BrokerId(0))
             .with_host(StrBytes::from_string(host.to_string()))
             .with_port(i32::from(port))])
-        .with_cluster_id(Some(StrBytes::from_static_str("pg_topics")))
+        .with_cluster_id(Some(StrBytes::from_string(cluster_id(db)?)))
         .with_controller_id(BrokerId(0))
         .with_topics(topics))
 }

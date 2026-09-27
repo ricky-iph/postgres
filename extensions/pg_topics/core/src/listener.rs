@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::{
-    ApiKey, FetchRequest, FindCoordinatorRequest, HeartbeatRequest, InitProducerIdRequest,
-    JoinGroupRequest, LeaveGroupRequest, ListOffsetsRequest, MetadataRequest, OffsetCommitRequest,
-    OffsetFetchRequest, ProduceRequest, ResponseHeader, SaslAuthenticateRequest,
-    SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, SyncGroupRequest,
+    AlterConfigsRequest, ApiKey, CreateTopicsRequest, DeleteGroupsRequest, DeleteTopicsRequest,
+    DescribeClusterRequest, DescribeConfigsRequest, DescribeGroupsRequest, FetchRequest,
+    FindCoordinatorRequest, HeartbeatRequest, IncrementalAlterConfigsRequest,
+    InitProducerIdRequest, JoinGroupRequest, LeaveGroupRequest, ListGroupsRequest,
+    ListOffsetsRequest, MetadataRequest, OffsetCommitRequest, OffsetFetchRequest, ProduceRequest,
+    ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+    SaslHandshakeResponse, SyncGroupRequest,
 };
 use kafka_protocol::protocol::{decode_request_header_from_buffer, Decodable, Encodable, StrBytes};
 use kafka_protocol::ResponseError;
@@ -20,7 +23,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
 use crate::versions::supported;
-use crate::{groups, handlers};
+use crate::{admin, groups, handlers};
 
 const MAX_PENDING: usize = 64;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -335,6 +338,83 @@ fn session(shared: &Arc<Shared>, pending: Slot, tcp: TcpStream) -> anyhow::Resul
                 let req = OffsetFetchRequest::decode(&mut frame, version)?;
                 let body = groups::offset_fetch(client, &req, version)?;
                 Some(response(id, key, version, &body)?)
+            }
+            (ApiKey::CreateTopics, Some((client, _))) => {
+                let req = CreateTopicsRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &admin::create_topics(client, &req)?,
+                )?)
+            }
+            (ApiKey::DeleteTopics, Some((client, _))) => {
+                let req = DeleteTopicsRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &admin::delete_topics(client, &req)?,
+                )?)
+            }
+            (ApiKey::DescribeConfigs, Some((client, _))) => {
+                let req = DescribeConfigsRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &admin::describe_configs(client, &req)?,
+                )?)
+            }
+            (ApiKey::AlterConfigs, Some((client, _))) => {
+                let req = AlterConfigsRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &admin::alter_configs(client, &req)?,
+                )?)
+            }
+            (ApiKey::IncrementalAlterConfigs, Some((client, _))) => {
+                let req = IncrementalAlterConfigsRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &admin::incremental_alter_configs(client, &req)?,
+                )?)
+            }
+            (ApiKey::DeleteGroups, Some((client, _))) => {
+                let req = DeleteGroupsRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &admin::delete_groups(client, &req)?,
+                )?)
+            }
+            (ApiKey::DescribeCluster, Some((client, _))) => {
+                DescribeClusterRequest::decode(&mut frame, version)?;
+                let body = admin::describe_cluster(client, &cfg.advertised_host, cfg.port)?;
+                Some(response(id, key, version, &body)?)
+            }
+            (ApiKey::ListGroups, Some((client, _))) => {
+                let req = ListGroupsRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &admin::list_groups(client, &req)?,
+                )?)
+            }
+            (ApiKey::DescribeGroups, Some((client, _))) => {
+                let req = DescribeGroupsRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &admin::describe_groups(client, &req)?,
+                )?)
             }
             (_, Some(_)) => bail!("{key:?} came after authentication"),
         };

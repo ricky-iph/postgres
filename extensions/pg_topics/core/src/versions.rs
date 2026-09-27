@@ -1,6 +1,6 @@
 use kafka_protocol::messages::ApiKey;
 
-pub const VERSIONS: [(ApiKey, i16, i16); 15] = [
+pub const VERSIONS: [(ApiKey, i16, i16); 24] = [
     (ApiKey::ApiVersions, 0, 3),
     (ApiKey::SaslHandshake, 1, 1),
     (ApiKey::SaslAuthenticate, 0, 2),
@@ -16,6 +16,15 @@ pub const VERSIONS: [(ApiKey, i16, i16); 15] = [
     (ApiKey::OffsetCommit, 2, 8),
     (ApiKey::OffsetFetch, 1, 8),
     (ApiKey::InitProducerId, 0, 4),
+    (ApiKey::CreateTopics, 2, 7),
+    (ApiKey::DeleteTopics, 1, 5),
+    (ApiKey::DescribeConfigs, 1, 4),
+    (ApiKey::AlterConfigs, 0, 2),
+    (ApiKey::IncrementalAlterConfigs, 0, 1),
+    (ApiKey::DeleteGroups, 0, 2),
+    (ApiKey::DescribeCluster, 0, 1),
+    (ApiKey::ListGroups, 0, 4),
+    (ApiKey::DescribeGroups, 0, 5),
 ];
 
 pub fn supported(key: ApiKey, version: i16) -> bool {
@@ -54,6 +63,8 @@ mod tests {
         assert!(!supported(ApiKey::Produce, 2));
         assert!(!supported(ApiKey::Produce, 10));
         assert!(!supported(ApiKey::SaslHandshake, 0));
-        assert!(!supported(ApiKey::CreateTopics, 2));
+        assert!(supported(ApiKey::CreateTopics, 2));
+        assert!(!supported(ApiKey::CreateTopics, 1));
+        assert!(!supported(ApiKey::DeleteRecords, 0));
     }
 }

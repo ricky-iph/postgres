@@ -222,7 +222,75 @@ def group_offsets(group):
             print("offset", tp.topic, tp.partition, tp.offset, tp.error.name() if tp.error else "NONE", flush=True)
 
 
+def create_topic_validate_only(topic, partitions):
+    from confluent_kafka.admin import AdminClient, NewTopic
+    admin = AdminClient(base())
+    fs = admin.create_topics([NewTopic(topic, num_partitions=int(partitions), replication_factor=1)],
+                              validate_only=True)
+    for future in fs.values():
+        try:
+            future.result(timeout=20)
+            print("validate_only NONE", flush=True)
+        except KafkaException as e:
+            print("validate_only", e.args[0].name(), flush=True)
+
+
+def delete_topic(topic):
+    from confluent_kafka.admin import AdminClient
+    admin = AdminClient(base())
+    for future in admin.delete_topics([topic]).values():
+        try:
+            future.result(timeout=20)
+            print("delete_topic NONE", flush=True)
+        except KafkaException as e:
+            print("delete_topic", e.args[0].name(), flush=True)
+
+
+def legacy_alter(topic, pairs):
+    from confluent_kafka.admin import AdminClient, ConfigResource
+    admin = AdminClient(base())
+    set_config = dict(p.split("=", 1) for p in pairs.split(",") if p)
+    resource = ConfigResource(ConfigResource.Type.TOPIC, topic, set_config=set_config)
+    for future in admin.alter_configs([resource]).values():
+        try:
+            future.result(timeout=20)
+            print("legacy_alter NONE", flush=True)
+        except KafkaException as e:
+            print("legacy_alter", e.args[0].name(), flush=True)
+
+
+def incremental_alter(topic, key, op, value=None):
+    from confluent_kafka.admin import AdminClient, ConfigResource, ConfigEntry, AlterConfigOpType
+    admin = AdminClient(base())
+    entry = ConfigEntry(key, value, incremental_operation=AlterConfigOpType[op.upper()])
+    resource = ConfigResource(ConfigResource.Type.TOPIC, topic, incremental_configs=[entry])
+    for future in admin.incremental_alter_configs([resource]).values():
+        try:
+            future.result(timeout=20)
+            print("incremental_alter NONE", flush=True)
+        except KafkaException as e:
+            print("incremental_alter", e.args[0].name(), flush=True)
+
+
+def cluster_id():
+    c = consumer()
+    print("cluster_id", c.list_topics(timeout=10).cluster_id, flush=True)
+    c.close()
+
+
+def describe_config_sources(topic):
+    from confluent_kafka.admin import AdminClient, ConfigResource
+    admin = AdminClient(base())
+    resource = ConfigResource(ConfigResource.Type.TOPIC, topic)
+    for future in admin.describe_configs([resource]).values():
+        for name, entry in sorted(future.result(timeout=20).items()):
+            print("config", name, entry.value, int(entry.source), flush=True)
+
+
 if __name__ == "__main__":
     {"produce": produce, "consume": consume, "offsets": offsets, "latency": latency, "metadata": metadata,
      "traffic": traffic, "raw": raw, "member": member, "idempotent": idempotent, "transactional": transactional,
-     "group_offsets": group_offsets}[sys.argv[1]](*sys.argv[2:])
+     "group_offsets": group_offsets,
+     "create_topic_validate_only": create_topic_validate_only, "delete_topic": delete_topic,
+     "legacy_alter": legacy_alter, "incremental_alter": incremental_alter, "cluster_id": cluster_id,
+     "describe_config_sources": describe_config_sources}[sys.argv[1]](*sys.argv[2:])

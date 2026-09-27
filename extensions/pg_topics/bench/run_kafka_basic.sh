@@ -23,8 +23,11 @@ psql_as slow "SELECT topic.create_topic('slow.s_q', 1)" >/dev/null
 start_listener
 chk "the listener binds the port that ALTER DATABASE postgres SET pg_topics.port gives" \
   "listening on port $KPORT" "$(listener_status)"
-chk "an ApiVersions version that is not known gets the v0 response with UNSUPPORTED_VERSION" 1 \
-  "$(kafka_py alice alice-pw raw 0000000b0012006300000007000000 | grep -c '^raw 00000064000000070023' || true)"
+raw=$(kafka_py alice alice-pw raw 0000000b0012006300000007000000 | grep '^raw ' | cut -d' ' -f2)
+api_count=$((16#${raw:20:8}))
+expected_len=$(printf '%08x%08x%04x' $((10 + 6 * api_count)) 7 35)
+chk "an ApiVersions version that is not known gets the v0 response with UNSUPPORTED_VERSION, and the frame length matches the advertised API count" \
+  "$expected_len" "${raw:0:20}"
 chk "a Metadata request before authentication closes the connection with no response" "raw closed" \
   "$(kafka_py alice alice-pw raw 0000000e00030000000000010000000000000000 | grep '^raw' || true)"
 chk "before authentication, a frame above 64 KiB closes the connection at once" "raw closed" \
