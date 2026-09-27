@@ -109,3 +109,52 @@ gap_free() {
                FROM ($rows) r GROUP BY t, band) s ON s.t = p.topic AND s.band = p.band
     WHERE p.schema_name = 'public' AND p.topic IN ($names)"
 }
+
+listener_status() {
+  psql_as postgres "SELECT query FROM pg_stat_activity WHERE backend_type = 'pg_topics listener' ORDER BY pid"
+}
+
+listener_pid() {
+  psql_as postgres "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_topics listener'"
+}
+
+restart_listener() {
+  local old
+  old=$(listener_pid)
+  psql_as postgres "SELECT pg_terminate_backend($old)" >/dev/null
+  wait_for "[ \"\$(listener_pid)\" != '$old' ] && [ \"\$(listener_status)\" = 'listening on port $KPORT' ]"
+}
+
+start_listener() {
+  KPORT=$(free_port)
+  make_cert "$WORK" >/dev/null
+  docker build -q -t pg_topics_python:2.15.1 "$HERE/clients/python" >/dev/null 2>&1 || { echo "FAIL  docker build of clients/python"; exit 1; }
+  psql_as postgres "ALTER SYSTEM SET pg_topics.tls_cert_file = '$WORK/server.crt'" >/dev/null
+  psql_as postgres "ALTER SYSTEM SET pg_topics.tls_key_file = '$WORK/server.key'" >/dev/null
+  psql_as postgres "ALTER SYSTEM SET pg_topics.advertised_host = '127.0.0.1'" >/dev/null
+  psql_as postgres "SELECT pg_reload_conf()" >/dev/null
+  psql_as postgres "ALTER DATABASE postgres SET pg_topics.port = $KPORT" >/dev/null
+  restart_listener
+}
+
+kafka_py() {
+  local user=$1 password=$2
+  shift 2
+  docker run --rm --network host -v "$WORK:/w:ro" -v "$HERE/clients/python:/app:ro" \
+    -e BOOTSTRAP="127.0.0.1:$KPORT" -e KAFKA_USER="$user" -e KAFKA_PASSWORD="$password" \
+    pg_topics_python:2.15.1 python /app/client.py "$@" 2>&1
+}
+
+java_config() {
+  cat >"$WORK/$1.properties" <<PROPS
+security.protocol=SASL_SSL
+sasl.mechanism=PLAIN
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="$1" password="$2";
+ssl.truststore.type=PEM
+ssl.truststore.location=/w/server.crt
+PROPS
+}
+
+kafka_java() {
+  docker run --rm -i --network host -v "$WORK:/w:ro" confluentinc/cp-kafka:7.7.1 "$@" 2>&1
+}

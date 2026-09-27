@@ -609,15 +609,28 @@ DECLARE
     t text := substr(band_offsets.topic, length(s) + 2);
 BEGIN
     IF NOT EXISTS (SELECT FROM topic.topic_config c WHERE c.schema_name = s AND c.topic = t) THEN
-        RAISE EXCEPTION 'topic.band_offsets: topic % does not exist', band_offsets.topic USING ERRCODE = '42P01';
-    END IF;
-    IF NOT has_table_privilege(topic.caller(), format('%I.%I', s, t), 'SELECT') THEN
+        RAISE EXCEPTION 'topic.band_offsets: role % may not read topic %', topic.caller(), band_offsets.topic
+            USING ERRCODE = '42501';
+    ELSIF NOT has_table_privilege(topic.caller(), format('%I.%I', s, t), 'SELECT') THEN
         RAISE EXCEPTION 'topic.band_offsets: role % may not read topic %', topic.caller(), band_offsets.topic
             USING ERRCODE = '42501';
     END IF;
     RETURN QUERY SELECT p.band, p.oldest_offset, p.next_offset FROM topic.topic_band_position p
     WHERE p.schema_name = s AND p.topic = t ORDER BY p.band;
 END
+$$;
+
+CREATE FUNCTION topic.kafka_topics(names text[]) RETURNS TABLE (topic text, band_count smallint, visible boolean)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT c.schema_name || '.' || c.topic, c.band_count,
+           has_table_privilege(topic.caller(), r.oid, 'SELECT')
+           OR has_any_column_privilege(topic.caller(), r.oid, 'INSERT')
+    FROM topic.topic_config c
+    JOIN pg_namespace n ON n.nspname = c.schema_name
+    JOIN pg_class r ON r.relnamespace = n.oid AND r.relname = c.topic
+    WHERE $1 IS NULL OR c.schema_name || '.' || c.topic = ANY ($1)
+    ORDER BY 1
 $$;
 
 CREATE FUNCTION topic.fetch(topic text, band int, from_offset bigint, max_rows int DEFAULT 500, filter jsonb DEFAULT NULL)

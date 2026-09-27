@@ -24,6 +24,9 @@ pg_test = []
 pgrx = "=0.12.9"
 pg_topics_core = { path = "../core" }
 
+[patch.crates-io]
+kafka-protocol = { path = "../vendor/kafka-protocol" }
+
 [dev-dependencies]
 pgrx-tests = "=0.12.9"
 

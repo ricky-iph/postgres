@@ -2,7 +2,8 @@
 #![allow(unexpected_cfgs)]
 
 use std::collections::HashMap;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
+use std::net::TcpListener;
 use std::panic::{AssertUnwindSafe, UnwindSafe};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,16 @@ static DATABASES: GucSetting<Option<&'static CStr>> =
 static GROUP_MIN_SESSION_MS: GucSetting<i32> = GucSetting::<i32>::new(6000);
 static GROUP_MAX_SESSION_MS: GucSetting<i32> = GucSetting::<i32>::new(1_800_000);
 static GROUP_INITIAL_REBALANCE_DELAY_MS: GucSetting<i32> = GucSetting::<i32>::new(3000);
+static PORT: GucSetting<i32> = GucSetting::<i32>::new(9092);
+static ADVERTISED_HOST: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(Some(c"localhost"));
+static MAX_CLIENTS: GucSetting<i32> = GucSetting::<i32>::new(100);
+static MAX_MESSAGE_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1_048_576);
+static TLS_CERT_FILE: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+static TLS_KEY_FILE: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+static TLS_USE_POSTGRES_CERT: GucSetting<bool> = GucSetting::<bool>::new(false);
 const STAMP_LOCK: i32 = 0x7067_7473;
 
 #[pg_extern(immutable, strict)]
@@ -552,6 +563,92 @@ pub extern "C" fn pg_topics_partition_main(_arg: pg_sys::Datum) {
     unsafe { pg_sys::proc_exit(1) }
 }
 
+type ListenerSettings = Result<Option<pgt::listener::Config>, String>;
+
+fn listener_settings(database: &str) -> spi::Result<ListenerSettings> {
+    let settings = Spi::get_one::<Vec<String>>(
+        "SELECT ARRAY[current_setting('pg_topics.port'), current_setting('pg_topics.advertised_host'),
+                      current_setting('pg_topics.max_clients'), current_setting('pg_topics.max_message_bytes'),
+                      current_setting('pg_topics.tls_cert_file'), current_setting('pg_topics.tls_key_file'),
+                      current_setting('pg_topics.tls_use_postgres_cert'), current_setting('ssl'),
+                      current_setting('ssl_cert_file'), current_setting('ssl_key_file'),
+                      current_setting('data_directory'), current_setting('port')]",
+    )?
+    .unwrap_or_default();
+    Ok(listener_config(database, &settings))
+}
+
+fn listener_config(database: &str, settings: &[String]) -> ListenerSettings {
+    let [port, host, max_clients, max_bytes, cert, key, use_pg, ssl, ssl_cert, ssl_key, data_dir, pg_port] =
+        settings
+    else {
+        return Err("no listener: the settings cannot be read".into());
+    };
+    let number = |name: &str, value: &str| {
+        value
+            .parse::<usize>()
+            .map_err(|e| format!("no listener: {name} = {value:?}: {e}"))
+    };
+    let port = number("pg_topics.port", port)? as u16;
+    if port == 0 {
+        return Ok(None);
+    }
+    let in_data = |p: &str| match p.starts_with('/') {
+        true => p.to_string(),
+        false => format!("{data_dir}/{p}"),
+    };
+    let (cert, key) = match (cert.trim(), key.trim()) {
+        ("", "") if use_pg == "on" && ssl == "on" => (in_data(ssl_cert), in_data(ssl_key)),
+        ("", "") => return Err(
+            "no listener: set pg_topics.tls_cert_file and pg_topics.tls_key_file, or pg_topics.tls_use_postgres_cert with ssl = on".into(),
+        ),
+        ("", _) | (_, "") => return Err(
+            "no listener: set both pg_topics.tls_cert_file and pg_topics.tls_key_file".into(),
+        ),
+        (cert, key) => (in_data(cert), in_data(key)),
+    };
+    let tls = pgt::listener::tls_config(&cert, &key).map_err(|e| format!("no listener: {e}"))?;
+    Ok(Some(pgt::listener::Config {
+        port,
+        pg_port: number("port", pg_port)? as u16,
+        database: database.to_string(),
+        advertised_host: host.clone(),
+        max_clients: number("pg_topics.max_clients", max_clients)?,
+        max_message_bytes: number("pg_topics.max_message_bytes", max_bytes)?,
+        tls,
+    }))
+}
+
+#[no_mangle]
+#[pg_guard]
+pub extern "C" fn pg_topics_listener_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM);
+    let database = BackgroundWorker::get_extra();
+    BackgroundWorker::connect_worker_to_spi(Some(database), None);
+    let status = match in_transaction(|| listener_settings(database)) {
+        Err(reason) => reason,
+        Ok(None) => "no listener: pg_topics.port is 0".to_string(),
+        Ok(Some(cfg)) => match TcpListener::bind(("0.0.0.0", cfg.port)) {
+            Err(e) => format!("bind failed: {e}"),
+            Ok(listener) => {
+                let port = cfg.port;
+                match std::thread::Builder::new()
+                    .name("pg_topics listener".into())
+                    .spawn(move || pgt::listener::run(listener, cfg))
+                {
+                    Ok(_) => format!("listening on port {port}"),
+                    Err(e) => format!("no listener: {e}"),
+                }
+            }
+        },
+    };
+    log!("pg_topics listener {database}: {status}");
+    let status = CString::new(status).unwrap_or_default();
+    unsafe { pg_sys::pgstat_report_activity(pg_sys::BackendState::STATE_RUNNING, status.as_ptr()) };
+    while wait_latch(10_000) {}
+    unsafe { pg_sys::proc_exit(1) }
+}
+
 #[pg_guard]
 pub extern "C" fn _PG_init() {
     if unsafe { !pg_sys::process_shared_preload_libraries_in_progress } {
@@ -603,6 +700,68 @@ pub extern "C" fn _PG_init() {
         GucContext::Suset,
         GucFlags::default(),
     );
+    GucRegistry::define_int_guc(
+        "pg_topics.port",
+        "The TCP port of the Kafka listener. 0 means no listener.",
+        "The listener reads it at start. Set it per database with ALTER DATABASE.",
+        &PORT,
+        0,
+        65535,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_topics.advertised_host",
+        "The host name that Metadata gives to Kafka clients.",
+        "The listener reads it at start.",
+        &ADVERTISED_HOST,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_topics.max_clients",
+        "The largest number of authenticated Kafka clients per listener.",
+        "Each client holds one Postgres connection. Set max_connections above it.",
+        &MAX_CLIENTS,
+        1,
+        100_000,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_topics.max_message_bytes",
+        "The largest record batch in bytes that Produce accepts.",
+        "A larger batch gets MESSAGE_TOO_LARGE.",
+        &MAX_MESSAGE_BYTES,
+        1024,
+        1 << 30,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_topics.tls_cert_file",
+        "The PEM certificate file of the Kafka listener.",
+        "A relative path starts at the data directory.",
+        &TLS_CERT_FILE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        "pg_topics.tls_key_file",
+        "The PEM private key file of the Kafka listener.",
+        "A relative path starts at the data directory.",
+        &TLS_KEY_FILE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        "pg_topics.tls_use_postgres_cert",
+        "The Kafka listener uses ssl_cert_file and ssl_key_file.",
+        "Only when pg_topics.tls_cert_file and pg_topics.tls_key_file are empty and ssl is on.",
+        &TLS_USE_POSTGRES_CERT,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
     let list = DATABASES
         .get()
         .map(|list| list.to_string_lossy().into_owned())
@@ -628,6 +787,14 @@ pub extern "C" fn _PG_init() {
             .set_type("pg_topics sync")
             .set_library("pg_topics")
             .set_function("pg_topics_sync_main")
+            .set_extra(database)
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .enable_spi_access()
+            .load();
+        BackgroundWorkerBuilder::new(&format!("pg_topics listener {database}"))
+            .set_type("pg_topics listener")
+            .set_library("pg_topics")
+            .set_function("pg_topics_listener_main")
             .set_extra(database)
             .set_restart_time(Some(Duration::from_secs(5)))
             .enable_spi_access()
@@ -1022,6 +1189,35 @@ mod tests {
         assert_eq!(
             one::<i64>("SELECT count(*) FROM pgt_skip.s_q WHERE log_offset IS NULL"),
             Some(3)
+        );
+    }
+
+    #[pg_test]
+    fn kafka_topics_shows_what_the_caller_may_read_or_write() {
+        tenant("pgt_meta");
+        Spi::run("CREATE ROLE pgt_writer; CREATE ROLE pgt_nobody").unwrap();
+        Spi::run("SET LOCAL ROLE pgt_meta").unwrap();
+        Spi::run(
+            "SELECT topic.create_topic('pgt_meta.m_q', 3);
+             GRANT INSERT (band, key, value, headers, producer_timestamp) ON pgt_meta.m_q TO pgt_writer;
+             RESET ROLE",
+        )
+        .unwrap();
+        let seen = |role: &str, names: &str| {
+            Spi::run(&format!("SET LOCAL ROLE {role}")).unwrap();
+            let rows = one::<Vec<String>>(&format!(
+                "SELECT coalesce(array_agg(topic || ':' || band_count || ':' || visible), '{{}}')
+                 FROM topic.kafka_topics({names})"
+            ));
+            Spi::run("RESET ROLE").unwrap();
+            rows
+        };
+        let visible = Some(vec!["pgt_meta.m_q:3:true".to_string()]);
+        assert_eq!(seen("pgt_meta", "NULL"), visible);
+        assert_eq!(seen("pgt_writer", "NULL"), visible);
+        assert_eq!(
+            seen("pgt_nobody", "ARRAY['pgt_meta.m_q', 'pgt_meta.none_q']"),
+            Some(vec!["pgt_meta.m_q:3:false".to_string()])
         );
     }
 

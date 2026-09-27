@@ -1,0 +1,180 @@
+import os
+import socket
+import ssl
+import sys
+import threading
+import time
+
+from confluent_kafka import Consumer, Producer, TopicPartition
+
+
+def base():
+    return {
+        "bootstrap.servers": os.environ["BOOTSTRAP"],
+        "security.protocol": "SASL_SSL",
+        "sasl.mechanism": "PLAIN",
+        "sasl.username": os.environ["KAFKA_USER"],
+        "sasl.password": os.environ["KAFKA_PASSWORD"],
+        "ssl.ca.location": "/w/server.crt",
+        "error_cb": lambda e: print("cb", e.name(), e.str(), flush=True),
+    }
+
+
+def consumer(**extra):
+    return Consumer({**base(), "group.id": "pg_topics_harness", "enable.auto.commit": False,
+                     "enable.auto.offset.store": False, **extra})
+
+
+def report(err, msg):
+    if err:
+        print("err", err.name(), flush=True)
+    else:
+        print("ok", msg.partition(), msg.offset(), flush=True)
+
+
+def produce(topic, count, mode="json", compression="none", keys="", partition=-1,
+            timestamp=0, acks="all"):
+    p = Producer({**base(), "partitioner": "murmur2_random", "compression.type": compression,
+                  "acks": acks, "linger.ms": 50, "message.max.bytes": 64000000,
+                  "batch.size": 64000000, "message.timeout.ms": 10000, "retries": 0})
+    for i in range(int(count)):
+        key = None
+        if keys == "long":
+            key = "k" * 41
+        elif keys:
+            key = f"{keys}-{i}"
+        value = {"json": f'{{"i": {i}}}', "text": "not json",
+                 "mid": '"' + "x" * 200000 + '"',
+                 "big": '"' + "x" * 1050000 + '"',
+                 "bomb": '"' + "0" * 20000000 + '"'}[mode]
+        p.produce(topic, value=value.encode(), key=key, partition=int(partition),
+                  timestamp=int(timestamp), headers=[("n", str(i).encode())], on_delivery=report)
+    left = p.flush(60)
+    print("left", left, flush=True)
+
+
+def consume(topic, partition, offset, count, reset="earliest", cfg=""):
+    c = consumer(**{"auto.offset.reset": reset, **{k: int(v) for k, v in
+                    (item.split("=") for item in cfg.split(",") if item)}})
+    c.assign([TopicPartition(topic, int(partition), int(offset))])
+    got, end = 0, time.monotonic() + 20
+    while got < int(count) and time.monotonic() < end:
+        m = c.poll(1)
+        if m is None:
+            continue
+        if m.error():
+            print("err", m.error().name(), m.error().str(), flush=True)
+            break
+        got += 1
+        key = m.key().decode() if m.key() is not None else "-"
+        print("msg", m.partition(), m.offset(), key, m.value().decode(), m.timestamp()[0], flush=True)
+    print("count", got, flush=True)
+    c.close()
+
+
+def metadata(topic):
+    c = consumer()
+    found = c.list_topics(topic, timeout=10).topics[topic]
+    print("metadata", found.error.name() if found.error else "NONE", flush=True)
+    c.close()
+
+
+def offsets(topic, partition, ts):
+    c = consumer()
+    tp = TopicPartition(topic, int(partition))
+    lo, hi = c.get_watermark_offsets(tp, timeout=10)
+    print("watermarks", lo, hi, flush=True)
+    found = c.offsets_for_times([TopicPartition(topic, int(partition), int(ts))], timeout=10)
+    print("time", found[0].offset, flush=True)
+    c.close()
+
+
+def latency(topic):
+    c = consumer(**{"fetch.wait.max.ms": 5000, "fetch.min.bytes": 1})
+    tp = TopicPartition(topic, 0)
+    _, hi = c.get_watermark_offsets(tp, timeout=10)
+    c.assign([TopicPartition(topic, 0, hi)])
+    c.poll(3)
+    sent = {}
+    p = Producer({**base(), "linger.ms": 0})
+    p.produce(topic, value=b'{"late": 1}', partition=0,
+              on_delivery=lambda e, m: sent.setdefault("at", time.monotonic()))
+    p.flush(10)
+    m = c.poll(10)
+    got = time.monotonic()
+    if m is None or m.error() or "at" not in sent:
+        print("latency none", flush=True)
+    else:
+        print("latency", int((got - sent["at"]) * 1000), flush=True)
+    c.close()
+
+
+def raw(request):
+    host, port = os.environ["BOOTSTRAP"].split(":")
+    tls = ssl.create_default_context(cafile="/w/server.crt")
+    data = b""
+    closed = False
+    with socket.create_connection((host, int(port))) as s, tls.wrap_socket(s, server_hostname=host) as t:
+        t.sendall(bytes.fromhex(request))
+        t.settimeout(2)
+        try:
+            while True:
+                chunk = t.recv(65536)
+                if not chunk:
+                    closed = True
+                    break
+                data += chunk
+        except (TimeoutError, socket.timeout):
+            pass
+        except (ssl.SSLError, ConnectionError):
+            closed = True
+    if data:
+        print("raw", data.hex(), flush=True)
+    elif closed:
+        print("raw closed", flush=True)
+    else:
+        print("raw timeout", flush=True)
+
+
+def traffic(topic, seconds):
+    p = Producer({**base(), "linger.ms": 5, "message.timeout.ms": 120000})
+    c = consumer(**{"auto.offset.reset": "earliest"})
+    c.assign([TopicPartition(topic, 0, 0)])
+    seen, stop = set(), threading.Event()
+
+    def read():
+        while not stop.is_set():
+            m = c.poll(0.5)
+            if m is not None and not m.error():
+                seen.add(m.value().decode())
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    delivered, failed = set(), []
+
+    def done(err, msg):
+        if err:
+            failed.append(err.name())
+        else:
+            delivered.add(msg.value().decode())
+
+    end, i = time.monotonic() + float(seconds), 0
+    while time.monotonic() < end:
+        p.produce(topic, value=f'{{"i": {i}}}'.encode(), partition=0, on_delivery=done)
+        p.poll(0)
+        i += 1
+        time.sleep(0.01)
+    p.flush(120)
+    deadline = time.monotonic() + 30
+    while not delivered <= seen and time.monotonic() < deadline:
+        time.sleep(0.2)
+    stop.set()
+    reader.join()
+    c.close()
+    print("sent", i, "delivered", len(delivered), "failed", len(failed),
+          "consumed", len(delivered & seen), flush=True)
+
+
+if __name__ == "__main__":
+    {"produce": produce, "consume": consume, "offsets": offsets, "latency": latency, "metadata": metadata,
+     "traffic": traffic, "raw": raw}[sys.argv[1]](*sys.argv[2:])
