@@ -15,11 +15,12 @@ CREATE TABLE topic.topic_config (
     sync_enabled       boolean  NOT NULL DEFAULT false,
     shape_version      integer  NOT NULL DEFAULT 0,
     backlog_age        interval NOT NULL DEFAULT '0',
+    stamped_at         timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (schema_name, topic),
     CHECK ((sync_table IS NULL) = (sync_key IS NULL)),
     CHECK (NOT sync_enabled OR sync_table IS NOT NULL),
     CHECK (retention_interval > interval '0'),
-    CHECK (max_backlog_age > interval '0')
+    CHECK (max_backlog_age >= interval '2 seconds')
 ) WITH (fillfactor = 50);
 
 CREATE TABLE topic.topic_band_position (
@@ -132,6 +133,10 @@ BEGIN
     IF c.backlog_age > c.max_backlog_age THEN
         RAISE EXCEPTION 'topic: %.% backlog_age % is above max_backlog_age %',
             TG_TABLE_SCHEMA, TG_TABLE_NAME, c.backlog_age, c.max_backlog_age;
+    END IF;
+    IF clock_timestamp() - c.stamped_at > c.max_backlog_age THEN
+        RAISE EXCEPTION 'topic: the stamper has not run on %.% since %, which is longer than max_backlog_age %',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME, c.stamped_at, c.max_backlog_age;
     END IF;
     wanted := CASE c.min_durability WHEN 'relaxed' THEN 'off' WHEN 'durable' THEN 'on' ELSE 'remote_apply' END;
     IF array_position(levels, wanted) > array_position(levels, current_setting('synchronous_commit')) THEN

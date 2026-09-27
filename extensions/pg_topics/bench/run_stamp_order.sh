@@ -6,7 +6,7 @@ source "$HERE/lib.sh"
 
 : "${PG_CONFIG:?set PG_CONFIG to the pg_config of the PostgreSQL 17 copy}"
 PGBIN=$("$PG_CONFIG" --bindir)
-PORT=$((20000 + RANDOM % 20000))
+PORT=$(free_port)
 WORK=$(mktemp -d)
 PGDATA="$WORK/data"
 
@@ -21,7 +21,7 @@ trap cleanup EXIT
 "$PGBIN/initdb" -D "$PGDATA" -U postgres --auth-local=trust --auth-host=scram-sha-256 >/dev/null
 cat >>"$PGDATA/postgresql.conf" <<EOF
 shared_preload_libraries = 'pg_topics'
-pg_topics.databases = 'postgres'
+pg_topics.databases = ''
 pg_topics.failover_is_fenced = on
 EOF
 start_pg >/dev/null

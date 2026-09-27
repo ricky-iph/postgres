@@ -1,10 +1,14 @@
 // pgrx::pg_module_magic! checks every pgrx pgNN feature; only pg14..pg17 are declared here.
 #![allow(unexpected_cfgs)]
 
+use std::collections::HashMap;
 use std::ffi::CStr;
-use std::panic::AssertUnwindSafe;
+use std::panic::{AssertUnwindSafe, UnwindSafe};
+use std::time::{Duration, Instant};
 
+use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::datum::Interval;
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
 use pgrx::spi::{self, quote_qualified_identifier};
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
@@ -14,6 +18,9 @@ pgrx::pg_module_magic!();
 extension_sql_file!("../sql/pg_topics.sql", finalize);
 
 static FAILOVER_IS_FENCED: GucSetting<bool> = GucSetting::<bool>::new(false);
+static DATABASES: GucSetting<Option<&'static CStr>> =
+    GucSetting::<Option<&'static CStr>>::new(None);
+const STAMP_LOCK: i32 = 0x7067_7473;
 
 #[pg_extern(immutable, strict)]
 #[search_path(pg_catalog, pg_temp)]
@@ -56,12 +63,22 @@ fn text_arg(value: &str) -> (PgOid, Option<pg_sys::Datum>) {
     (PgBuiltInOids::TEXTOID.oid(), value.into_datum())
 }
 
+fn read_one<T: FromDatum + IntoDatum>(
+    sql: &str,
+    args: Vec<(PgOid, Option<pg_sys::Datum>)>,
+) -> spi::Result<Option<T>> {
+    Spi::connect(|client| client.select(sql, Some(1), Some(args))?.first().get_one())
+}
+
 #[pg_extern]
 #[search_path(pg_catalog, pg_temp)]
 fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -> spi::Result<i32> {
     let names = || vec![text_arg(schema_name), text_arg(topic)];
-    Spi::run("SET LOCAL row_security = off")?;
-    let owner = Spi::get_one_with_args::<pg_sys::Oid>(
+    read_one::<String>(
+        "SELECT pg_catalog.set_config('row_security', 'off', true)",
+        vec![],
+    )?;
+    let owner = read_one::<pg_sys::Oid>(
         "SELECT (SELECT c.relowner FROM topic.topic_config t
                  JOIN pg_catalog.pg_namespace n ON n.nspname = t.schema_name
                  JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.topic
@@ -69,6 +86,37 @@ fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -
         names(),
     )?
     .unwrap_or_else(|| error!("topic.stamp_topic: topic {schema_name}.{topic} does not exist"));
+    let queue = quote_qualified_identifier(schema_name, topic);
+    let beat = |backlog: Option<Interval>| {
+        let mut args = names();
+        args.push((PgBuiltInOids::INTERVALOID.oid(), backlog.into_datum()));
+        let stale = read_one::<bool>(
+            "SELECT backlog_age IS DISTINCT FROM $3 OR stamped_at < clock_timestamp() - interval '1 second'
+             FROM topic.topic_config WHERE schema_name = $1 AND topic = $2",
+            args.clone(),
+        )?;
+        if stale != Some(true) {
+            return Ok(());
+        }
+        Spi::run_with_args(
+            "UPDATE topic.topic_config
+             SET backlog_age = $3,
+                 stamped_at = CASE WHEN stamped_at < clock_timestamp() - interval '1 second'
+                                   THEN clock_timestamp() ELSE stamped_at END
+             WHERE schema_name = $1 AND topic = $2",
+            Some(args),
+        )
+    };
+    let pending = as_owner(owner, || {
+        read_one::<bool>(
+            &format!("SELECT EXISTS (SELECT FROM {queue} WHERE log_offset IS NULL)"),
+            vec![],
+        )
+    })?;
+    if pending != Some(true) {
+        beat(Interval::new(0, 0, 0).ok())?;
+        return Ok(0);
+    }
     let (next, stamped_by) = Spi::get_two_with_args::<Vec<i64>, Vec<Option<String>>>(
         "SELECT array_agg(next_offset ORDER BY band), array_agg(stamped_by ORDER BY band)
          FROM (SELECT band, next_offset, stamped_by FROM topic.topic_band_position
@@ -81,7 +129,6 @@ fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -
     )?
     .unwrap_or_default();
 
-    let queue = quote_qualified_identifier(schema_name, topic);
     let (bands, counts, backlog) = as_owner(owner, || -> spi::Result<_> {
         let (bands, counts, exact) = Spi::get_three_with_args::<Vec<i16>, Vec<i64>, bool>(
             &format!(
@@ -113,7 +160,7 @@ fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -
             );
         }
         let backlog = Spi::get_one::<Interval>(&format!(
-            "SELECT coalesce((SELECT now() - published_at FROM {queue}
+            "SELECT coalesce((SELECT clock_timestamp() - published_at FROM {queue}
                               WHERE log_offset IS NULL ORDER BY seq LIMIT 1), interval '0')"
         ))?;
         Ok((
@@ -143,13 +190,7 @@ fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -
          WHERE p.schema_name = $1 AND p.topic = $2 AND p.band = u.band",
         Some(args),
     )?;
-    let mut args = names();
-    args.push((PgBuiltInOids::INTERVALOID.oid(), backlog.into_datum()));
-    Spi::run_with_args(
-        "UPDATE topic.topic_config SET backlog_age = $3
-         WHERE schema_name = $1 AND topic = $2 AND backlog_age <> $3",
-        Some(args),
-    )?;
+    beat(backlog)?;
 
     if total > 0 {
         Spi::run_with_args(
@@ -158,6 +199,139 @@ fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -
         )?;
     }
     Ok(total as i32)
+}
+
+fn database_names(list: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    for name in list.split(',').map(str::trim) {
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn in_transaction<R>(f: impl FnOnce() -> spi::Result<R> + UnwindSafe) -> R {
+    BackgroundWorker::transaction(AssertUnwindSafe(|| f().unwrap_or_else(|e| error!("{e}"))))
+}
+
+fn guarded<R>(f: impl FnOnce() -> R + UnwindSafe) -> Option<R> {
+    PgTryBuilder::new(|| Some(f()))
+        .catch_others(|e| {
+            unsafe { pg_sys::AbortCurrentTransaction() };
+            let (CaughtError::PostgresError(report)
+            | CaughtError::ErrorReport(report)
+            | CaughtError::RustPanic {
+                ereport: report, ..
+            }) = e;
+            warning!(
+                "pg_topics stamper: {}. The stamper tries again in 1 s.",
+                report.message()
+            );
+            None
+        })
+        .execute()
+}
+
+fn topic_list() -> spi::Result<Option<Vec<(String, String)>>> {
+    if read_one::<bool>(
+        "SELECT EXISTS (SELECT FROM pg_catalog.pg_extension WHERE extname = 'pg_topics')",
+        vec![],
+    )? != Some(true)
+    {
+        return Ok(None);
+    }
+    let (schemas, topics) = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT array_agg(schema_name ORDER BY schema_name, topic),
+                        array_agg(topic ORDER BY schema_name, topic)
+                 FROM topic.topic_config",
+                Some(1),
+                None,
+            )?
+            .first()
+            .get_two::<Vec<String>, Vec<String>>()
+    })?;
+    Ok(Some(
+        schemas
+            .unwrap_or_default()
+            .into_iter()
+            .zip(topics.unwrap_or_default())
+            .collect(),
+    ))
+}
+
+fn stamp_locked(schema_name: &str, topic: &str) -> spi::Result<i32> {
+    let args = || {
+        vec![
+            text_arg(schema_name),
+            text_arg(topic),
+            (PgBuiltInOids::INT4OID.oid(), STAMP_LOCK.into_datum()),
+        ]
+    };
+    if read_one::<bool>(
+        "SELECT pg_catalog.pg_try_advisory_xact_lock($3, pg_catalog.hashtext($1 || '.' || $2))",
+        args(),
+    )? != Some(true)
+    {
+        return Ok(0);
+    }
+    Ok(read_one::<i32>("SELECT topic.stamp_topic($1, $2)", args())?.unwrap_or(0))
+}
+
+fn wait_latch(ms: i64) -> bool {
+    unsafe {
+        pg_sys::WaitLatch(
+            pg_sys::MyLatch,
+            (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_EXIT_ON_PM_DEATH) as i32,
+            ms,
+            pg_sys::PG_WAIT_EXTENSION,
+        );
+        pg_sys::ResetLatch(pg_sys::MyLatch);
+        pg_sys::check_for_interrupts!();
+    }
+    !BackgroundWorker::sigterm_received()
+}
+
+#[no_mangle]
+#[pg_guard]
+pub extern "C" fn pg_topics_stamper_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM);
+    BackgroundWorker::connect_worker_to_spi(Some(BackgroundWorker::get_extra()), None);
+    in_transaction(|| Spi::run("SET search_path = pg_catalog, pg_temp"));
+    let mut retry_after: HashMap<(String, String), Instant> = HashMap::new();
+    let mut pause = 50;
+    while wait_latch(pause) {
+        let Some(Some(topics)) = guarded(|| in_transaction(topic_list)) else {
+            pause = 1000;
+            continue;
+        };
+        let mut stamped = false;
+        for (schema_name, topic) in topics {
+            if retry_after
+                .get(&(schema_name.clone(), topic.clone()))
+                .is_some_and(|at| Instant::now() < *at)
+            {
+                continue;
+            }
+            match guarded(|| in_transaction(|| stamp_locked(&schema_name, &topic))) {
+                Some(n) => {
+                    stamped |= n > 0;
+                    retry_after.remove(&(schema_name, topic));
+                }
+                None => {
+                    retry_after.insert(
+                        (schema_name, topic),
+                        Instant::now() + Duration::from_secs(1),
+                    );
+                }
+            }
+        }
+        unsafe { pg_sys::pgstat_report_stat(false) };
+        pause = if stamped { 1 } else { 50 };
+    }
+    unsafe { pg_sys::proc_exit(1) }
 }
 
 #[pg_guard]
@@ -173,6 +347,28 @@ pub extern "C" fn _PG_init() {
         GucContext::Suset,
         GucFlags::default(),
     );
+    GucRegistry::define_string_guc(
+        "pg_topics.databases",
+        "The databases that get the pg_topics workers.",
+        "A comma list of database names. A change needs a server restart.",
+        &DATABASES,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+    let list = DATABASES
+        .get()
+        .map(|list| list.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for database in database_names(&list) {
+        BackgroundWorkerBuilder::new(&format!("pg_topics stamper {database}"))
+            .set_type("pg_topics stamper")
+            .set_library("pg_topics")
+            .set_function("pg_topics_stamper_main")
+            .set_extra(database)
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .enable_spi_access()
+            .load();
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -213,6 +409,15 @@ mod tests {
         let too_high =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::band_for("x", 1025)));
         assert!(too_high.is_err());
+    }
+
+    #[pg_test]
+    fn databases_guc_parses() {
+        assert_eq!(
+            crate::database_names(" postgres, app ,, other_db, app"),
+            vec!["postgres", "app", "other_db"]
+        );
+        assert!(crate::database_names(" , ").is_empty());
     }
 
     fn one<T: IntoDatum + FromDatum>(sql: &str) -> Option<T> {
@@ -376,6 +581,38 @@ mod tests {
         assert!(error_of("SELECT topic.publish('public.slow_q', '{}')")
             .unwrap()
             .contains("above max_backlog_age"));
+    }
+
+    #[pg_test]
+    fn publish_refuses_without_recent_stamp() {
+        Spi::run("SELECT topic.create_topic('public.stale_q', 1)").unwrap();
+        Spi::run("SELECT topic.publish('public.stale_q', '{}')").unwrap();
+        Spi::run(
+            "UPDATE topic.topic_config SET stamped_at = now() - interval '2 minutes' WHERE topic = 'stale_q'",
+        )
+        .unwrap();
+        assert!(error_of("SELECT topic.publish('public.stale_q', '{}')")
+            .unwrap()
+            .contains("the stamper has not run"));
+        assert_eq!(
+            one::<i32>("SELECT topic.stamp_topic('public', 'stale_q')"),
+            Some(1)
+        );
+        Spi::run("SELECT topic.publish('public.stale_q', '{}')").unwrap();
+    }
+
+    #[pg_test]
+    fn max_backlog_age_is_at_least_2_seconds() {
+        Spi::run("SELECT topic.create_topic('public.short_q', 1)").unwrap();
+        assert!(error_of(
+            "UPDATE topic.topic_config SET max_backlog_age = '1 second' WHERE topic = 'short_q'"
+        )
+        .unwrap()
+        .contains("check constraint"));
+        Spi::run(
+            "UPDATE topic.topic_config SET max_backlog_age = '2 seconds' WHERE topic = 'short_q'",
+        )
+        .unwrap();
     }
 
     #[pg_test]
