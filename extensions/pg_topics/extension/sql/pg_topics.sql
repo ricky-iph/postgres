@@ -97,6 +97,13 @@ CREATE TABLE topic.topic_producers (
         REFERENCES topic.topic_band_position (schema_name, topic, band) ON DELETE CASCADE
 );
 
+CREATE TABLE topic.producer_ids (
+    producer_id bigint      PRIMARY KEY,
+    owner_role   name        NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    last_used_at timestamptz NOT NULL DEFAULT now()
+);
+
 ALTER TABLE topic.topic_groups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE topic.topic_group_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE topic.topic_offsets ENABLE ROW LEVEL SECURITY;
@@ -349,6 +356,9 @@ CREATE FUNCTION topic.reap() RETURNS void
 LANGUAGE sql SET search_path = pg_catalog, pg_temp
 AS $$
     DELETE FROM topic.topic_producers WHERE updated_at < now() - interval '1 day';
+    DELETE FROM topic.producer_ids i
+    WHERE i.last_used_at < now() - interval '7 days'
+      AND NOT EXISTS (SELECT FROM topic.topic_producers p WHERE p.producer_id = i.producer_id);
     DELETE FROM topic.topic_groups g
     WHERE g.state = 'Empty'
       AND NOT starts_with(g.group_name, '__pg_topics_sync:')
@@ -631,6 +641,78 @@ AS $$
     JOIN pg_class r ON r.relnamespace = n.oid AND r.relname = c.topic
     WHERE $1 IS NULL OR c.schema_name || '.' || c.topic = ANY ($1)
     ORDER BY 1
+$$;
+
+CREATE SEQUENCE topic.producer_id_seq;
+
+CREATE FUNCTION topic.init_producer_id() RETURNS bigint
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+    INSERT INTO topic.producer_ids (producer_id, owner_role) VALUES (nextval('topic.producer_id_seq'), topic.caller())
+    RETURNING producer_id
+$$;
+
+CREATE FUNCTION topic.produce_check(schema_name text, topic text, producer_id bigint, epoch smallint,
+                                    band smallint, first_seq int, last_seq int) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    queue regclass := to_regclass(format('%I.%I', produce_check.schema_name, produce_check.topic));
+    owner name;
+    used timestamptz;
+    ring topic.topic_producers[];
+    ring_epoch smallint;
+    newest smallint;
+BEGIN
+    IF queue IS NULL
+       OR NOT EXISTS (SELECT FROM topic.topic_config c
+                      WHERE c.schema_name = produce_check.schema_name AND c.topic = produce_check.topic)
+       OR NOT has_any_column_privilege(topic.caller(), queue, 'INSERT') THEN
+        RAISE EXCEPTION 'topic.produce_check: role % may not write topic %.%',
+            topic.caller(), produce_check.schema_name, produce_check.topic USING ERRCODE = '42501';
+    END IF;
+    -- A retry on a new connection waits here until its first attempt commits or aborts, and then sees its ring row.
+    SELECT i.owner_role, i.last_used_at INTO owner, used
+    FROM topic.producer_ids i WHERE i.producer_id = produce_check.producer_id FOR UPDATE;
+    IF NOT coalesce(pg_has_role(topic.caller(), to_regrole(quote_ident(owner)), 'member'), false) THEN
+        RAISE EXCEPTION 'topic.produce_check: producer % is not known to role %', produce_check.producer_id, topic.caller()
+            USING ERRCODE = 'PT004';
+    END IF;
+    IF used < now() - interval '1 minute' THEN
+        UPDATE topic.producer_ids i SET last_used_at = now() WHERE i.producer_id = produce_check.producer_id;
+    END IF;
+    ring := ARRAY(SELECT p FROM topic.topic_producers p
+                  WHERE p.schema_name = produce_check.schema_name AND p.topic = produce_check.topic
+                    AND p.producer_id = produce_check.producer_id AND p.band = produce_check.band);
+    ring_epoch := (SELECT max(r.producer_epoch) FROM unnest(ring) r);
+    IF epoch < ring_epoch THEN
+        RAISE EXCEPTION 'topic.produce_check: producer % sent epoch %, which is older than epoch %',
+            produce_check.producer_id, epoch, ring_epoch USING ERRCODE = 'PT003';
+    ELSIF epoch > ring_epoch THEN
+        DELETE FROM topic.topic_producers p
+        WHERE p.schema_name = produce_check.schema_name AND p.topic = produce_check.topic
+          AND p.producer_id = produce_check.producer_id AND p.band = produce_check.band;
+        ring := '{}';
+    END IF;
+    IF EXISTS (SELECT FROM unnest(ring) r WHERE r.first_sequence = first_seq) THEN
+        RETURN true;
+    END IF;
+    SELECT r.slot INTO newest FROM unnest(ring) r
+    WHERE CASE WHEN r.last_sequence = 2147483647 THEN 0 ELSE r.last_sequence + 1 END = first_seq;
+    IF cardinality(ring) > 0 AND newest IS NULL THEN
+        RAISE EXCEPTION 'topic.produce_check: producer % sent sequence % on %.% band %, which is not the next sequence',
+            produce_check.producer_id, first_seq, produce_check.schema_name, produce_check.topic, produce_check.band
+            USING ERRCODE = 'PT002';
+    END IF;
+    INSERT INTO topic.topic_producers
+        (schema_name, topic, producer_id, producer_epoch, band, slot, first_sequence, last_sequence, base_offset)
+    VALUES (produce_check.schema_name, produce_check.topic, produce_check.producer_id, epoch, produce_check.band,
+            coalesce((newest + 1) % 5, 0), first_seq, last_seq, -1)
+    ON CONFLICT ON CONSTRAINT topic_producers_pkey DO UPDATE
+    SET producer_epoch = EXCLUDED.producer_epoch, first_sequence = EXCLUDED.first_sequence,
+        last_sequence = EXCLUDED.last_sequence, base_offset = EXCLUDED.base_offset, updated_at = now();
+    RETURN false;
+END
 $$;
 
 CREATE FUNCTION topic.fetch(topic text, band int, from_offset bigint, max_rows int DEFAULT 500, filter jsonb DEFAULT NULL)
@@ -1190,6 +1272,8 @@ SELECT pg_catalog.pg_extension_config_dump('topic.topic_groups', '');
 SELECT pg_catalog.pg_extension_config_dump('topic.topic_group_members', '');
 SELECT pg_catalog.pg_extension_config_dump('topic.topic_offsets', '');
 SELECT pg_catalog.pg_extension_config_dump('topic.topic_producers', '');
+SELECT pg_catalog.pg_extension_config_dump('topic.producer_id_seq', '');
+SELECT pg_catalog.pg_extension_config_dump('topic.producer_ids', '');
 GRANT SELECT ON topic.topic_groups, topic.topic_group_members, topic.topic_offsets TO PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.stamp_topic(text, text, int) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.retention_check(oid) FROM PUBLIC;

@@ -806,6 +806,11 @@ mod tests {
                  (schema_name, topic, producer_id, producer_epoch, band, slot, first_sequence, last_sequence, base_offset, updated_at)
              VALUES ('public', 'kept_q', 1, 0, 0, 0, 0, 0, -1, now() - interval '25 hours'),
                     ('public', 'kept_q', 2, 0, 0, 0, 0, 0, -1, now() - interval '23 hours');
+             INSERT INTO topic.producer_ids (producer_id, owner_role, created_at, last_used_at)
+             VALUES (1, 'postgres', now() - interval '9 days', now() - interval '8 days'),
+                    (2, 'postgres', now() - interval '9 days', now() - interval '8 days'),
+                    (3, 'postgres', now() - interval '9 days', now() - interval '6 days'),
+                    (4, 'postgres', now() - interval '9 days', now() - interval '1 hour');
              INSERT INTO topic.topic_groups (group_name, owner_role, state, updated_at)
              VALUES ('old_empty', 'postgres', 'Empty', now() - interval '2 hours'),
                     ('new_empty', 'postgres', 'Empty', now() - interval '30 minutes'),
@@ -833,6 +838,12 @@ mod tests {
                 "SELECT array_agg(producer_id ORDER BY producer_id) FROM topic.topic_producers"
             ),
             Some(vec![2])
+        );
+        assert_eq!(
+            one::<Vec<i64>>(
+                "SELECT array_agg(producer_id ORDER BY producer_id) FROM topic.producer_ids"
+            ),
+            Some(vec![2, 3, 4])
         );
         assert_eq!(
             one::<Vec<String>>(
@@ -1571,6 +1582,158 @@ mod tests {
             ),
             Some("MEMBER_ID_REQUIRED true".into())
         );
+    }
+
+    fn produce_check(epoch: i16, first: i32, last: i32) -> String {
+        format!("SELECT topic.produce_check('public', 'idem_q', 7, {epoch}::smallint, 0::smallint, {first}, {last})")
+    }
+
+    fn accepted(epoch: i16, first: i32, last: i32) -> Option<bool> {
+        one::<bool>(&produce_check(epoch, first, last)).map(|duplicate| !duplicate)
+    }
+
+    fn ring() -> Option<String> {
+        one::<String>(
+            "SELECT string_agg(producer_epoch || ':' || first_sequence || '-' || last_sequence, ',' ORDER BY slot)
+             FROM topic.topic_producers WHERE topic = 'idem_q' AND producer_id = 7",
+        )
+    }
+
+    fn idem_topic() {
+        Spi::run(
+            "SELECT topic.create_topic('public.idem_q', 1);
+             INSERT INTO topic.producer_ids (producer_id, owner_role) VALUES (7, current_user)",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn producer_ring_keeps_the_newest_five_in_ring_order() {
+        idem_topic();
+        for i in 0..7 {
+            assert_eq!(accepted(0, i * 10, i * 10 + 9), Some(true));
+        }
+        assert_eq!(
+            ring(),
+            Some("0:50-59,0:60-69,0:20-29,0:30-39,0:40-49".into())
+        );
+    }
+
+    #[pg_test]
+    fn producer_retry_of_an_in_flight_batch_matches_by_first_sequence() {
+        idem_topic();
+        for i in 0..5 {
+            assert_eq!(accepted(0, i * 5, i * 5 + 4), Some(true));
+        }
+        assert_eq!(accepted(0, 10, 14), Some(false));
+        assert_eq!(ring(), Some("0:0-4,0:5-9,0:10-14,0:15-19,0:20-24".into()));
+        assert_eq!(accepted(0, 25, 29), Some(true));
+    }
+
+    #[pg_test]
+    fn producer_gap_is_out_of_order() {
+        idem_topic();
+        assert_eq!(accepted(0, 0, 9), Some(true));
+        assert_eq!(state_of(&produce_check(0, 11, 20)), Some("PT002".into()));
+        assert_eq!(ring(), Some("0:0-9".into()));
+    }
+
+    #[pg_test]
+    fn producer_retry_of_a_200_record_batch_matches_its_first_sequence() {
+        idem_topic();
+        assert_eq!(accepted(0, 0, 199), Some(true));
+        assert_eq!(accepted(0, 0, 199), Some(false));
+        assert_eq!(ring(), Some("0:0-199".into()));
+    }
+
+    #[pg_test]
+    fn producer_sequence_wraps() {
+        idem_topic();
+        assert_eq!(accepted(0, 2147483600, 2147483647), Some(true));
+        assert_eq!(accepted(0, 0, 9), Some(true));
+        assert_eq!(accepted(0, 0, 9), Some(false));
+        assert_eq!(ring(), Some("0:2147483600-2147483647,0:0-9".into()));
+    }
+
+    #[pg_test]
+    fn producer_batch_across_the_wrap_is_followed_by_its_next_sequence() {
+        idem_topic();
+        assert_eq!(accepted(0, 2147483600, 12), Some(true));
+        assert_eq!(accepted(0, 13, 20), Some(true));
+    }
+
+    #[pg_test]
+    fn producer_epoch_bump_starts_a_fresh_ring_old_epoch_fails() {
+        idem_topic();
+        assert_eq!(accepted(0, 0, 9), Some(true));
+        assert_eq!(accepted(0, 10, 19), Some(true));
+        assert_eq!(accepted(1, 0, 4), Some(true));
+        assert_eq!(ring(), Some("1:0-4".into()));
+        assert_eq!(accepted(1, 0, 4), Some(false));
+        assert_eq!(state_of(&produce_check(0, 20, 29)), Some("PT003".into()));
+    }
+
+    #[pg_test]
+    fn produce_check_refuses_a_caller_without_insert() {
+        idem_topic();
+        Spi::run("CREATE ROLE pgt_idem; UPDATE topic.producer_ids SET owner_role = 'pgt_idem'")
+            .unwrap();
+        Spi::run("SET LOCAL ROLE pgt_idem").unwrap();
+        let refused = state_of(&produce_check(0, 0, 9));
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(refused, Some("42501".into()));
+        assert_eq!(ring(), None);
+        Spi::run("GRANT INSERT (value) ON public.idem_q TO pgt_idem; SET LOCAL ROLE pgt_idem")
+            .unwrap();
+        let granted = accepted(0, 0, 9);
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(granted, Some(true));
+    }
+
+    #[pg_test]
+    fn producer_id_serves_only_its_owner_and_unknown_ids_fail() {
+        idem_topic();
+        Spi::run(
+            "CREATE ROLE pgt_a; CREATE ROLE pgt_b;
+             GRANT INSERT (value) ON public.idem_q TO pgt_a, pgt_b",
+        )
+        .unwrap();
+        let check = |role: &str, id: i64| {
+            Spi::run(&format!("SET LOCAL ROLE {role}")).unwrap();
+            let state = state_of(&format!(
+                "SELECT topic.produce_check('public', 'idem_q', {id}, 0::smallint, 0::smallint, 0, 9)"
+            ));
+            Spi::run("RESET ROLE").unwrap();
+            state
+        };
+        Spi::run("SET LOCAL ROLE pgt_a").unwrap();
+        let id = one::<i64>("SELECT topic.init_producer_id()").unwrap();
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(check("pgt_b", id), Some("PT004".into()));
+        assert_eq!(check("pgt_a", id), None);
+        assert_eq!(check("pgt_a", 99), Some("PT004".into()));
+        Spi::run(
+            "INSERT INTO topic.producer_ids (producer_id, owner_role) VALUES (98, 'pgt_gone')",
+        )
+        .unwrap();
+        assert_eq!(check("pgt_a", 98), Some("PT004".into()));
+    }
+
+    #[pg_test]
+    fn produce_check_marks_the_producer_used_at_most_once_a_minute() {
+        idem_topic();
+        let used_after = |age: &str, first: i32| {
+            Spi::run(&format!(
+                "UPDATE topic.producer_ids SET last_used_at = now() - interval '{age}' WHERE producer_id = 7"
+            ))
+            .unwrap();
+            accepted(0, first, first + 9);
+            one::<String>(
+                "SELECT (now() - last_used_at)::text FROM topic.producer_ids WHERE producer_id = 7",
+            )
+        };
+        assert_eq!(used_after("2 minutes", 0), Some("00:00:00".into()));
+        assert_eq!(used_after("30 seconds", 10), Some("00:00:30".into()));
     }
 }
 

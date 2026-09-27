@@ -138,7 +138,7 @@ pub fn find_coordinator(
     port: u16,
 ) -> FindCoordinatorResponse {
     let error = match req.key_type {
-        0 => 0,
+        0 | 1 => 0,
         _ => ResponseError::InvalidRequest.code(),
     };
     let node = |key: StrBytes| {
@@ -780,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn find_coordinator_answers_node_0_for_groups_and_an_error_for_transactions() {
+    fn find_coordinator_answers_node_0_for_groups_and_transactions_and_an_error_for_others() {
         let mut req = FindCoordinatorRequest::default()
             .with_key(StrBytes::from_static_str("g"))
             .with_coordinator_keys(vec![StrBytes::from_static_str("g")]);
@@ -793,6 +793,11 @@ mod tests {
         assert_eq!(batched.coordinators.len(), 1);
         assert_eq!(batched.coordinators[0].host.as_str(), "h");
         req.key_type = 1;
+        assert_eq!(
+            find_coordinator(&req, 4, "h", 9092).coordinators[0].error_code,
+            0
+        );
+        req.key_type = 2;
         let resp = find_coordinator(&req, 4, "h", 9092);
         assert_eq!(
             resp.coordinators[0].error_code,

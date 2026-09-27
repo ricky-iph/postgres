@@ -14,9 +14,9 @@ use kafka_protocol::messages::metadata_response::{
 use kafka_protocol::messages::produce_request::PartitionProduceData;
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{
-    ApiVersionsResponse, BrokerId, FetchRequest, FetchResponse, ListOffsetsRequest,
-    ListOffsetsResponse, MetadataRequest, MetadataResponse, ProduceRequest, ProduceResponse,
-    TopicName,
+    ApiVersionsResponse, BrokerId, FetchRequest, FetchResponse, InitProducerIdRequest,
+    InitProducerIdResponse, ListOffsetsRequest, ListOffsetsResponse, MetadataRequest,
+    MetadataResponse, ProduceRequest, ProduceResponse, ProducerId, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
@@ -25,7 +25,7 @@ use kafka_protocol::records::{
 use kafka_protocol::ResponseError;
 use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::ToSql;
-use postgres::{Client, Config, Error, NoTls, Transaction};
+use postgres::{Client, Config, Error, IsolationLevel, NoTls, Transaction};
 
 use crate::batch::{decode_produce, finish_fetch_batch, Budget, DecodeError};
 use crate::partitions::message;
@@ -55,7 +55,11 @@ pub fn error_code(sqlstate: &str) -> i16 {
         "22P02" | "22021" | "22001" | "22P05" => ResponseError::InvalidRecord.code(),
         "42501" => ResponseError::TopicAuthorizationFailed.code(),
         "PT001" => ResponseError::OffsetOutOfRange.code(),
+        "PT002" => ResponseError::OutOfOrderSequenceNumber.code(),
+        "PT003" => ResponseError::InvalidProducerEpoch.code(),
+        "PT004" => ResponseError::UnknownProducerId.code(),
         "42P01" => ResponseError::UnknownTopicOrPartition.code(),
+        "57014" => ResponseError::RequestTimedOut.code(),
         _ => ResponseError::UnknownServerError.code(),
     }
 }
@@ -311,17 +315,39 @@ fn produce_band(
         quote(table)
     );
     let mut sp = tx.savepoint("pg_topics_band")?;
-    let inserted = sp.query_one(
-        &sql,
-        &[
-            &band,
-            &rows.keys,
-            &rows.values,
-            &rows.headers,
-            &rows.timestamps,
-        ],
-    );
-    match inserted.and_then(|row| row.try_get::<_, Option<i64>>(0)) {
+    let duplicate = match (records.first(), last_sequence(&records)) {
+        (Some(first), Some(last)) if first.producer_id >= 0 => sp
+            .query_one(
+                "SELECT topic.produce_check($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &schema,
+                    &table,
+                    &first.producer_id,
+                    &first.producer_epoch,
+                    &band,
+                    &first.sequence,
+                    &last,
+                ],
+            )
+            .and_then(|row| row.try_get::<_, bool>(0)),
+        _ => Ok(false),
+    };
+    let inserted = duplicate.and_then(|duplicate| match duplicate {
+        true => Ok(None),
+        false => sp
+            .query_one(
+                &sql,
+                &[
+                    &band,
+                    &rows.keys,
+                    &rows.values,
+                    &rows.headers,
+                    &rows.timestamps,
+                ],
+            )
+            .and_then(|row| row.try_get::<_, Option<i64>>(0)),
+    });
+    match inserted {
         Ok(at) => {
             sp.commit()?;
             Ok(Ok(at.unwrap_or(-1)))
@@ -331,6 +357,10 @@ fn produce_band(
             Ok(Err(db_code(e, topic)?))
         }
     }
+}
+
+fn last_sequence(records: &[Record]) -> Option<i32> {
+    records.last().map(|r| r.sequence & i32::MAX)
 }
 
 pub fn produce(
@@ -346,7 +376,10 @@ pub fn produce(
                 .try_get::<_, Option<i16>>(0)?,
         );
     }
-    let mut tx = db.transaction()?;
+    let mut tx = db
+        .build_transaction()
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .start()?;
     tx.execute(
         "SELECT set_config('synchronous_commit',
              CASE WHEN NOT $1 THEN 'off'
@@ -402,6 +435,21 @@ pub fn produce(
         }
     }
     Ok(ProduceResponse::default().with_responses(responses))
+}
+
+pub fn init_producer_id(
+    db: &mut Client,
+    req: &InitProducerIdRequest,
+) -> Result<InitProducerIdResponse, Error> {
+    if req.transactional_id.is_some() {
+        return Ok(InitProducerIdResponse::default()
+            .with_error_code(ResponseError::TransactionalIdAuthorizationFailed.code())
+            .with_producer_epoch(-1));
+    }
+    let id = db
+        .query_one("SELECT topic.init_producer_id()", &[])?
+        .try_get(0)?;
+    Ok(InitProducerIdResponse::default().with_producer_id(ProducerId(id)))
 }
 
 type BandOffsets = Result<Vec<(i32, i64, i64)>, i16>;
@@ -658,12 +706,36 @@ mod tests {
             ("22P05", ResponseError::InvalidRecord),
             ("42501", ResponseError::TopicAuthorizationFailed),
             ("PT001", ResponseError::OffsetOutOfRange),
+            ("PT002", ResponseError::OutOfOrderSequenceNumber),
             ("42P01", ResponseError::UnknownTopicOrPartition),
-            ("57014", ResponseError::UnknownServerError),
+            ("PT003", ResponseError::InvalidProducerEpoch),
+            ("PT004", ResponseError::UnknownProducerId),
+            ("57014", ResponseError::RequestTimedOut),
             ("P0001", ResponseError::UnknownServerError),
         ] {
             assert_eq!(error_code(state), code.code(), "{state}");
         }
+    }
+
+    #[test]
+    fn last_sequence_of_a_batch_across_the_wrap_restarts_at_0() {
+        let records: Vec<Record> = (0..61)
+            .map(|i| Record {
+                producer_id: 1,
+                offset: i,
+                sequence: 2147483600i32.wrapping_add(i as i32),
+                ..record(None, Some(b"1"))
+            })
+            .collect();
+        let mut buf = BytesMut::new();
+        let options = RecordEncodeOptions {
+            version: 2,
+            compression: Compression::None,
+        };
+        RecordBatchEncoder::encode(&mut buf, &records, &options).unwrap();
+        let decoded = decode_produce(buf.freeze(), &Budget::new(1 << 20)).unwrap();
+        assert_eq!(decoded[0].sequence, 2147483600);
+        assert_eq!(last_sequence(&decoded), Some(12));
     }
 
     #[test]

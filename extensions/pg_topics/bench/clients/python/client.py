@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 
-from confluent_kafka import Consumer, Producer, TopicPartition
+from confluent_kafka import Consumer, KafkaException, Producer, TopicPartition
 
 
 def base():
@@ -175,6 +175,26 @@ def traffic(topic, seconds):
           "consumed", len(delivered & seen), flush=True)
 
 
+def idempotent(topic, count):
+    p = Producer({**base(), "enable.idempotence": True, "linger.ms": 5, "message.timeout.ms": 120000})
+    acked, failed = [], []
+    for i in range(int(count)):
+        p.produce(topic, value=str(i).encode(),
+                  on_delivery=lambda err, msg: failed.append(err.name()) if err else acked.append(1))
+        p.poll(0)
+    p.flush(120)
+    print("acked", len(acked), "failed", len(failed), flush=True)
+
+
+def transactional():
+    p = Producer({**base(), "transactional.id": "pg_topics_harness"})
+    try:
+        p.init_transactions(20)
+        print("txn NONE", flush=True)
+    except KafkaException as e:
+        print("txn", e.args[0].name(), flush=True)
+
+
 def member(topic, group, name, cfg=""):
     c = consumer(**{"group.id": group, "session.timeout.ms": 6000, "heartbeat.interval.ms": 1000,
                     "auto.offset.reset": "earliest",
@@ -204,5 +224,5 @@ def group_offsets(group):
 
 if __name__ == "__main__":
     {"produce": produce, "consume": consume, "offsets": offsets, "latency": latency, "metadata": metadata,
-     "traffic": traffic, "raw": raw, "member": member,
+     "traffic": traffic, "raw": raw, "member": member, "idempotent": idempotent, "transactional": transactional,
      "group_offsets": group_offsets}[sys.argv[1]](*sys.argv[2:])

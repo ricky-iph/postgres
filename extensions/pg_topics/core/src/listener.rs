@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::{
-    ApiKey, FetchRequest, FindCoordinatorRequest, HeartbeatRequest, JoinGroupRequest,
-    LeaveGroupRequest, ListOffsetsRequest, MetadataRequest, OffsetCommitRequest,
+    ApiKey, FetchRequest, FindCoordinatorRequest, HeartbeatRequest, InitProducerIdRequest,
+    JoinGroupRequest, LeaveGroupRequest, ListOffsetsRequest, MetadataRequest, OffsetCommitRequest,
     OffsetFetchRequest, ProduceRequest, ResponseHeader, SaslAuthenticateRequest,
     SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, SyncGroupRequest,
 };
@@ -265,6 +265,15 @@ fn session(shared: &Arc<Shared>, pending: Slot, tcp: TcpStream) -> anyhow::Resul
                     0 => None,
                     _ => Some(response(id, key, version, &body)?),
                 }
+            }
+            (ApiKey::InitProducerId, Some((client, _))) => {
+                let req = InitProducerIdRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &handlers::init_producer_id(client, &req)?,
+                )?)
             }
             (ApiKey::Fetch, Some((client, _))) => {
                 let req = FetchRequest::decode(&mut frame, version)?;
