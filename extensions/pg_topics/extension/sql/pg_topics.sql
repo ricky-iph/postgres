@@ -47,6 +47,8 @@ CREATE TABLE topic.topic_groups (
     state            text    NOT NULL DEFAULT 'Empty'
         CHECK (state IN ('Empty', 'PreparingRebalance', 'CompletingRebalance', 'Stable', 'Dead')),
     expired_members  bigint  NOT NULL DEFAULT 0,
+    rebalance_started_at timestamptz,
+    pending_members  jsonb   NOT NULL DEFAULT '{}',
     updated_at       timestamptz NOT NULL DEFAULT now()
 );
 
@@ -57,8 +59,8 @@ CREATE TABLE topic.topic_group_members (
     client_id          text,
     session_timeout_ms integer     NOT NULL,
     rebalance_ms       integer     NOT NULL,
-    subscription       bytea,
-    assignment         bytea,
+    protocols          jsonb,
+    assignment         jsonb,
     last_heartbeat_at  timestamptz NOT NULL DEFAULT now(),
     joined_generation  integer,
     PRIMARY KEY (group_name, member_id)
@@ -357,6 +359,45 @@ AS $$
           JOIN topic.topic_config c ON c.schema_name = o.schema_name AND c.topic = o.topic
           WHERE o.group_name = g.group_name
           HAVING bool_and(c.offset_retention IS NOT NULL));
+    DELETE FROM topic.topic_groups g
+    WHERE g.state = 'Empty'
+      AND NOT starts_with(g.group_name, '__pg_topics_sync:')
+      AND NOT EXISTS (SELECT FROM topic.topic_group_members m WHERE m.group_name = g.group_name)
+      AND NOT EXISTS (SELECT FROM topic.topic_offsets o WHERE o.group_name = g.group_name)
+      AND g.updated_at < now() - interval '1 day';
+$$;
+
+CREATE FUNCTION topic.sync_base_owner(base regclass, sync_key text) RETURNS name
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    who text := topic.caller();
+    base_owner name;
+BEGIN
+    SELECT r.rolname INTO base_owner FROM pg_class k JOIN pg_roles r ON r.oid = k.relowner
+    WHERE k.oid = sync_base_owner.base AND k.relkind IN ('r', 'p');
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'topic: % is not an ordinary table', base;
+    END IF;
+    IF NOT pg_has_role(who, base_owner, 'member') THEN
+        RAISE EXCEPTION 'topic: role % is not a member of %, the owner of %', who, base_owner, base
+            USING ERRCODE = '42501';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = base AND a.attname = sync_base_owner.sync_key
+                   AND a.attnum > 0 AND NOT a.attisdropped) THEN
+        RAISE EXCEPTION 'topic: % has no column %', base, sync_base_owner.sync_key;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = base AND a.attname = sync_base_owner.sync_key
+                   AND a.attnotnull) THEN
+        RAISE EXCEPTION 'topic: column % of % allows NULL', sync_base_owner.sync_key, base
+            USING HINT = 'The sync key column must be NOT NULL.';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = base AND a.attname = 'event_at'
+                   AND a.atttypid = 'timestamptz'::regtype AND a.attnotnull AND NOT a.attisdropped) THEN
+        RAISE EXCEPTION 'topic: % has no column event_at timestamptz NOT NULL', base;
+    END IF;
+    RETURN base_owner;
+END
 $$;
 
 CREATE FUNCTION topic.attach(
@@ -376,31 +417,11 @@ DECLARE
     queue_owner name;
     grp text;
 BEGIN
-    SELECT n.nspname, k.relname || '_q', r.rolname INTO s, t, base_owner
-    FROM pg_class k JOIN pg_namespace n ON n.oid = k.relnamespace JOIN pg_roles r ON r.oid = k.relowner
-    WHERE k.oid = attach.base AND k.relkind IN ('r', 'p');
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'topic.attach: % is not an ordinary table', base;
-    END IF;
-    IF NOT pg_has_role(who, base_owner, 'member') THEN
-        RAISE EXCEPTION 'topic.attach: role % is not a member of %, the owner of %', who, base_owner, base
-            USING ERRCODE = '42501';
-    END IF;
+    base_owner := topic.sync_base_owner(base, attach.sync_key);
+    SELECT n.nspname, k.relname || '_q' INTO s, t
+    FROM pg_class k JOIN pg_namespace n ON n.oid = k.relnamespace WHERE k.oid = attach.base;
     IF NOT has_schema_privilege(who, s, 'CREATE') THEN
         RAISE EXCEPTION 'topic.attach: role % has no CREATE privilege on schema %', who, s USING ERRCODE = '42501';
-    END IF;
-    IF NOT EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = base AND a.attname = attach.sync_key
-                   AND a.attnum > 0 AND NOT a.attisdropped) THEN
-        RAISE EXCEPTION 'topic.attach: % has no column %', base, attach.sync_key;
-    END IF;
-    IF NOT EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = base AND a.attname = attach.sync_key
-                   AND a.attnotnull) THEN
-        RAISE EXCEPTION 'topic.attach: column % of % allows NULL', attach.sync_key, base
-            USING HINT = 'The sync key column must be NOT NULL.';
-    END IF;
-    IF NOT EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = base AND a.attname = 'event_at'
-                   AND a.atttypid = 'timestamptz'::regtype AND a.attnotnull AND NOT a.attisdropped) THEN
-        RAISE EXCEPTION 'topic.attach: % has no column event_at timestamptz NOT NULL', base;
     END IF;
     IF NOT EXISTS (SELECT FROM topic.topic_config c WHERE c.schema_name = s AND c.topic = t) THEN
         PERFORM topic.create_topic(s || '.' || t, band_count, retention, min_durability);
@@ -469,6 +490,608 @@ BEGIN
     END LOOP;
     EXECUTE format('CREATE TABLE %I.%I (%s event_at timestamptz NOT NULL, PRIMARY KEY (%I))', s, t, defs, sync_key);
     RETURN topic.attach(format('%I.%I', s, t)::regclass, sync_key, band_count, retention, min_durability);
+END
+$$;
+
+CREATE FUNCTION topic.owned_topic(topic text, OUT schema_name text, OUT topic_name text)
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    who text := topic.caller();
+    owner_name name;
+BEGIN
+    schema_name := split_part(owned_topic.topic, '.', 1);
+    topic_name := substr(owned_topic.topic, length(schema_name) + 2);
+    SELECT pg_get_userbyid(k.relowner) INTO owner_name
+    FROM topic.topic_config c
+    JOIN pg_namespace n ON n.nspname = c.schema_name
+    JOIN pg_class k ON k.relnamespace = n.oid AND k.relname = c.topic
+    WHERE c.schema_name = owned_topic.schema_name AND c.topic = topic_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'topic: topic % does not exist', owned_topic.topic USING ERRCODE = '42P01';
+    END IF;
+    IF NOT pg_has_role(who, owner_name, 'member') THEN
+        RAISE EXCEPTION 'topic: role % is not a member of %, the owner of topic %', who, owner_name, owned_topic.topic
+            USING ERRCODE = '42501';
+    END IF;
+END
+$$;
+
+CREATE FUNCTION topic.drop_topic(topic text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp SET lock_timeout = '2s'
+AS $$
+DECLARE
+    q record;
+BEGIN
+    SELECT * INTO q FROM topic.owned_topic(drop_topic.topic);
+    FOR attempt IN 1..3 LOOP
+        BEGIN
+            EXECUTE format('DROP TABLE %I.%I', q.schema_name, q.topic_name);
+            EXIT;
+        EXCEPTION WHEN lock_not_available THEN
+            IF attempt = 3 THEN
+                RAISE;
+            END IF;
+        END;
+    END LOOP;
+    IF EXISTS (SELECT FROM topic.topic_config c WHERE c.schema_name = q.schema_name AND c.topic = q.topic_name) THEN
+        RAISE EXCEPTION 'topic.drop_topic: the control rows of topic % remain after the drop', drop_topic.topic;
+    END IF;
+END
+$$;
+
+CREATE FUNCTION topic.set_retention(topic text, retention interval) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+    UPDATE topic.topic_config c SET retention_interval = $2
+    FROM topic.owned_topic($1) q WHERE c.schema_name = q.schema_name AND c.topic = q.topic_name
+$$;
+
+CREATE FUNCTION topic.set_backlog_limit(topic text, max_backlog_age interval) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+    UPDATE topic.topic_config c SET max_backlog_age = $2
+    FROM topic.owned_topic($1) q WHERE c.schema_name = q.schema_name AND c.topic = q.topic_name
+$$;
+
+CREATE FUNCTION topic.set_sync_enabled(topic text, enabled boolean) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+    UPDATE topic.topic_config c SET sync_enabled = $2
+    FROM topic.owned_topic($1) q WHERE c.schema_name = q.schema_name AND c.topic = q.topic_name
+$$;
+
+CREATE FUNCTION topic.set_durability(topic text, tier text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    q record;
+BEGIN
+    SELECT * INTO q FROM topic.owned_topic(set_durability.topic);
+    IF tier IN ('durable', 'replicated') AND NOT current_setting('pg_topics.failover_is_fenced')::bool THEN
+        RAISE EXCEPTION 'topic.set_durability: min_durability % needs pg_topics.failover_is_fenced = on', tier;
+    END IF;
+    IF tier = 'replicated' AND current_setting('synchronous_standby_names') = '' THEN
+        RAISE EXCEPTION 'topic.set_durability: min_durability replicated needs synchronous_standby_names';
+    END IF;
+    UPDATE topic.topic_config c SET min_durability = tier
+    WHERE c.schema_name = q.schema_name AND c.topic = q.topic_name;
+END
+$$;
+
+CREATE FUNCTION topic.set_sync(topic text, base regclass, sync_key text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    q record;
+    sync_owner name;
+BEGIN
+    SELECT * INTO q FROM topic.owned_topic(set_sync.topic);
+    SELECT g.owner_role INTO sync_owner FROM topic.topic_groups g
+    WHERE g.group_name = '__pg_topics_sync:' || q.schema_name || '.' || q.topic_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'topic.set_sync: topic % has no sync', set_sync.topic USING HINT = 'Use topic.attach first.';
+    END IF;
+    IF topic.sync_base_owner(base, set_sync.sync_key) <> sync_owner THEN
+        RAISE EXCEPTION 'topic.set_sync: the owner of % is not %, the owner of the sync of topic %',
+            base, sync_owner, set_sync.topic;
+    END IF;
+    UPDATE topic.topic_config c SET sync_table = base, sync_key = set_sync.sync_key
+    WHERE c.schema_name = q.schema_name AND c.topic = q.topic_name;
+END
+$$;
+
+CREATE FUNCTION topic.band_offsets(topic text) RETURNS TABLE (band smallint, oldest_offset bigint, next_offset bigint)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    s text := split_part(band_offsets.topic, '.', 1);
+    t text := substr(band_offsets.topic, length(s) + 2);
+BEGIN
+    IF NOT EXISTS (SELECT FROM topic.topic_config c WHERE c.schema_name = s AND c.topic = t) THEN
+        RAISE EXCEPTION 'topic.band_offsets: topic % does not exist', band_offsets.topic USING ERRCODE = '42P01';
+    END IF;
+    IF NOT has_table_privilege(topic.caller(), format('%I.%I', s, t), 'SELECT') THEN
+        RAISE EXCEPTION 'topic.band_offsets: role % may not read topic %', topic.caller(), band_offsets.topic
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN QUERY SELECT p.band, p.oldest_offset, p.next_offset FROM topic.topic_band_position p
+    WHERE p.schema_name = s AND p.topic = t ORDER BY p.band;
+END
+$$;
+
+CREATE FUNCTION topic.fetch(topic text, band int, from_offset bigint, max_rows int DEFAULT 500, filter jsonb DEFAULT NULL)
+RETURNS TABLE (log_offset bigint, key text, value jsonb, headers jsonb, published_at timestamptz)
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    s text := split_part($1, '.', 1);
+    t text := substr($1, length(s) + 2);
+    oldest bigint;
+BEGIN
+    SELECT b.oldest_offset INTO oldest FROM topic.band_offsets($1) b WHERE b.band = $2;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'topic.fetch: topic % has no band %', $1, $2 USING ERRCODE = '42P01';
+    END IF;
+    IF from_offset < oldest THEN
+        RAISE EXCEPTION 'topic.fetch: offset % is below the oldest offset % of band % of topic %',
+            from_offset, oldest, $2, $1 USING ERRCODE = 'PT001';
+    END IF;
+    RETURN QUERY EXECUTE format(
+        'SELECT q.log_offset, q.key::text, q.value, q.headers, q.published_at FROM %I.%I q
+         WHERE q.band = $1 AND q.log_offset >= $2 AND ($4 IS NULL OR q.value @> $4)
+         ORDER BY q.log_offset LIMIT $3', s, t)
+        USING $2, from_offset, max_rows, filter;
+END
+$$;
+
+CREATE FUNCTION topic.offset_for_time(topic text, band int, ts timestamptz) RETURNS bigint
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    s text := split_part(offset_for_time.topic, '.', 1);
+    t text := substr(offset_for_time.topic, length(s) + 2);
+    found_offset bigint;
+BEGIN
+    EXECUTE format('SELECT min(q.log_offset) FROM %I.%I q WHERE q.band = $1 AND q.published_at >= $2', s, t)
+        INTO found_offset USING offset_for_time.band, ts;
+    RETURN found_offset;
+END
+$$;
+
+CREATE FUNCTION topic.group_rebalance(group_name text) RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF EXISTS (SELECT FROM topic.topic_group_members m WHERE m.group_name = group_rebalance.group_name) THEN
+        UPDATE topic.topic_groups g
+        SET state = 'PreparingRebalance', updated_at = now(),
+            rebalance_started_at = CASE WHEN g.state = 'PreparingRebalance' THEN g.rebalance_started_at ELSE now() END
+        WHERE g.group_name = group_rebalance.group_name;
+    ELSE
+        UPDATE topic.topic_groups g
+        SET state = 'Empty', generation_id = g.generation_id + 1, leader_member_id = NULL, protocol_type = NULL,
+            protocol_name = NULL, rebalance_started_at = NULL, updated_at = now()
+        WHERE g.group_name = group_rebalance.group_name;
+    END IF;
+    PERFORM pg_notify('pg_topics_group', group_rebalance.group_name);
+END
+$$;
+
+CREATE FUNCTION topic.expire_members(group_name text) RETURNS int
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    n int;
+BEGIN
+    DELETE FROM topic.topic_group_members m
+    WHERE m.group_name = expire_members.group_name
+      AND m.last_heartbeat_at < now() - m.session_timeout_ms * interval '1 millisecond';
+    GET DIAGNOSTICS n = ROW_COUNT;
+    IF n > 0 THEN
+        UPDATE topic.topic_groups g SET expired_members = g.expired_members + n
+        WHERE g.group_name = expire_members.group_name;
+        PERFORM topic.group_rebalance(expire_members.group_name);
+    END IF;
+    RETURN n;
+END
+$$;
+
+CREATE FUNCTION topic.group_protocol(group_name text) RETURNS text
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp
+AS $$
+    WITH offers AS (
+        SELECT m.member_id, p.value->>'name' AS name, p.i
+        FROM topic.topic_group_members m, jsonb_array_elements(m.protocols) WITH ORDINALITY p(value, i)
+        WHERE m.group_name = $1),
+    common AS (
+        SELECT o.name FROM offers o GROUP BY o.name
+        HAVING count(DISTINCT o.member_id) = (SELECT count(DISTINCT a.member_id) FROM offers a)),
+    votes AS (
+        SELECT DISTINCT ON (o.member_id) o.name FROM offers o JOIN common c ON c.name = o.name
+        ORDER BY o.member_id, o.i)
+    SELECT v.name FROM votes v GROUP BY v.name ORDER BY count(*) DESC, v.name LIMIT 1
+$$;
+
+CREATE FUNCTION topic.group_enter(group_name text) RETURNS text
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    g topic.topic_groups;
+    from_empty boolean;
+    all_rejoined boolean;
+    longest int;
+BEGIN
+    SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = group_enter.group_name FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'UNKNOWN_MEMBER_ID';
+    END IF;
+    IF NOT pg_has_role(topic.caller(), g.owner_role, 'member') THEN
+        RETURN 'GROUP_AUTHORIZATION_FAILED';
+    END IF;
+    PERFORM topic.expire_members(g.group_name);
+    SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = g.group_name;
+    IF g.state <> 'PreparingRebalance' THEN
+        RETURN NULL;
+    END IF;
+    from_empty := g.leader_member_id IS NULL;
+    SELECT bool_and(m.joined_generation = g.generation_id), max(m.rebalance_ms) INTO all_rejoined, longest
+    FROM topic.topic_group_members m WHERE m.group_name = g.group_name;
+    IF from_empty THEN
+        longest := least(longest, current_setting('pg_topics.group_initial_rebalance_delay_ms')::int);
+    END IF;
+    IF (from_empty OR NOT all_rejoined) AND now() < g.rebalance_started_at + longest * interval '1 millisecond' THEN
+        RETURN NULL;
+    END IF;
+    DELETE FROM topic.topic_group_members m
+    WHERE m.group_name = g.group_name AND m.joined_generation IS DISTINCT FROM g.generation_id;
+    IF NOT EXISTS (SELECT FROM topic.topic_group_members m WHERE m.group_name = g.group_name) THEN
+        PERFORM topic.group_rebalance(g.group_name);
+        RETURN NULL;
+    END IF;
+    UPDATE topic.topic_group_members m SET assignment = NULL WHERE m.group_name = g.group_name;
+    UPDATE topic.topic_groups t
+    SET generation_id = t.generation_id + 1, state = 'CompletingRebalance', rebalance_started_at = NULL,
+        updated_at = now(), protocol_name = topic.group_protocol(t.group_name),
+        leader_member_id = (SELECT m.member_id FROM topic.topic_group_members m WHERE m.group_name = t.group_name
+                            ORDER BY m.member_id IS NOT DISTINCT FROM t.leader_member_id DESC, m.member_id LIMIT 1)
+    WHERE t.group_name = g.group_name;
+    PERFORM pg_notify('pg_topics_group', g.group_name);
+    RETURN NULL;
+END
+$$;
+
+CREATE FUNCTION topic.expire_groups() RETURNS void
+LANGUAGE sql SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT topic.group_enter(d.group_name)
+    FROM (SELECT DISTINCT m.group_name FROM topic.topic_group_members m
+          WHERE m.last_heartbeat_at < now() - current_setting('pg_topics.group_min_session_ms')::int * interval '1 millisecond'
+            AND m.last_heartbeat_at < now() - m.session_timeout_ms * interval '1 millisecond') d
+$$;
+
+CREATE FUNCTION topic.group_join_poll(
+    group_name text, INOUT member_id text,
+    OUT error text, OUT generation_id int, OUT protocol_name text, OUT leader_id text, OUT members jsonb)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    g topic.topic_groups;
+    me topic.topic_group_members;
+BEGIN
+    error := topic.group_enter(group_join_poll.group_name);
+    IF error IS NOT NULL THEN
+        RETURN;
+    END IF;
+    SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = group_join_poll.group_name;
+    UPDATE topic.topic_group_members m SET last_heartbeat_at = now()
+    WHERE m.group_name = g.group_name AND m.member_id = group_join_poll.member_id
+    RETURNING * INTO me;
+    IF NOT FOUND THEN
+        error := 'UNKNOWN_MEMBER_ID';
+        RETURN;
+    END IF;
+    IF g.state = 'PreparingRebalance' AND me.joined_generation = g.generation_id THEN
+        RETURN;
+    END IF;
+    IF g.state = 'PreparingRebalance' OR me.joined_generation <> g.generation_id - 1 THEN
+        error := 'REBALANCE_IN_PROGRESS';
+        RETURN;
+    END IF;
+    error := 'NONE';
+    generation_id := g.generation_id;
+    protocol_name := g.protocol_name;
+    leader_id := g.leader_member_id;
+    SELECT coalesce(jsonb_agg(jsonb_build_object('member_id', m.member_id, 'metadata', p.value->'metadata')
+                              ORDER BY m.member_id), '[]')
+    INTO members
+    FROM topic.topic_group_members m, jsonb_array_elements(m.protocols) p(value)
+    WHERE m.group_name = g.group_name AND p.value->>'name' = g.protocol_name
+      AND g.leader_member_id = group_join_poll.member_id;
+END
+$$;
+
+CREATE FUNCTION topic.group_join(
+    group_name text, INOUT member_id text, client_id text, session_ms int, rebalance_ms int,
+    protocol_type text, protocols jsonb,
+    OUT error text, OUT generation_id int, OUT protocol_name text, OUT leader_id text, OUT members jsonb)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    g topic.topic_groups;
+BEGIN
+    IF group_join.group_name = '' OR starts_with(group_join.group_name, '__pg_topics_sync:') THEN
+        error := 'INVALID_GROUP_ID';
+        RETURN;
+    END IF;
+    IF session_ms IS NULL OR rebalance_ms IS NULL OR rebalance_ms < 0
+       OR session_ms NOT BETWEEN current_setting('pg_topics.group_min_session_ms')::int
+                             AND current_setting('pg_topics.group_max_session_ms')::int THEN
+        error := 'INVALID_SESSION_TIMEOUT';
+        RETURN;
+    END IF;
+    IF jsonb_typeof(protocols) IS DISTINCT FROM 'array' OR protocols = '[]' THEN
+        error := 'INCONSISTENT_GROUP_PROTOCOL';
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT FROM jsonb_array_elements(protocols) p(value)
+               WHERE jsonb_typeof(p.value->'name') IS DISTINCT FROM 'string') THEN
+        error := 'INCONSISTENT_GROUP_PROTOCOL';
+        RETURN;
+    END IF;
+    INSERT INTO topic.topic_groups (group_name, owner_role) VALUES (group_join.group_name, topic.caller())
+    ON CONFLICT DO NOTHING;
+    error := topic.group_enter(group_join.group_name);
+    IF error IS NOT NULL THEN
+        RETURN;
+    END IF;
+    SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = group_join.group_name;
+    IF member_id = '' THEN
+        member_id := coalesce(client_id, '') || '-' || gen_random_uuid();
+        UPDATE topic.topic_groups t
+        SET updated_at = now(),
+            pending_members = jsonb_build_object(group_join.member_id, now() + session_ms * interval '1 millisecond')
+                || (SELECT coalesce(jsonb_object_agg(p.key, p.value), '{}') FROM jsonb_each_text(t.pending_members) p
+                    WHERE p.value::timestamptz > now())
+        WHERE t.group_name = g.group_name;
+        error := 'MEMBER_ID_REQUIRED';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT FROM topic.topic_group_members m
+                   WHERE m.group_name = g.group_name AND m.member_id = group_join.member_id)
+       AND NOT coalesce((g.pending_members ->> group_join.member_id)::timestamptz > now(), false) THEN
+        error := 'UNKNOWN_MEMBER_ID';
+        RETURN;
+    END IF;
+    IF (g.protocol_type IS DISTINCT FROM group_join.protocol_type
+        AND EXISTS (SELECT FROM topic.topic_group_members m
+                    WHERE m.group_name = g.group_name AND m.member_id <> group_join.member_id))
+       OR NOT EXISTS (SELECT FROM jsonb_array_elements(protocols) p(value)
+                      WHERE NOT EXISTS (SELECT FROM topic.topic_group_members m
+                                        WHERE m.group_name = g.group_name AND m.member_id <> group_join.member_id
+                                          AND NOT m.protocols @> jsonb_build_array(jsonb_build_object('name', p.value->'name')))) THEN
+        error := 'INCONSISTENT_GROUP_PROTOCOL';
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT FROM topic.topic_group_members m
+               WHERE m.group_name = g.group_name AND m.member_id = group_join.member_id
+                 AND m.joined_generation = g.generation_id - 1 AND m.protocols = group_join.protocols
+                 AND (g.state = 'CompletingRebalance' OR (g.state = 'Stable' AND m.member_id <> g.leader_member_id))) THEN
+        SELECT p.error, p.generation_id, p.protocol_name, p.leader_id, p.members
+        INTO error, generation_id, protocol_name, leader_id, members
+        FROM topic.group_join_poll(g.group_name, group_join.member_id) p;
+        RETURN;
+    END IF;
+    INSERT INTO topic.topic_group_members AS m
+        (group_name, member_id, owner_role, client_id, session_timeout_ms, rebalance_ms, protocols, joined_generation)
+    VALUES (g.group_name, group_join.member_id, g.owner_role, client_id, session_ms, rebalance_ms, protocols, g.generation_id)
+    ON CONFLICT ON CONSTRAINT topic_group_members_pkey DO UPDATE
+    SET client_id = EXCLUDED.client_id, session_timeout_ms = EXCLUDED.session_timeout_ms,
+        rebalance_ms = EXCLUDED.rebalance_ms, protocols = EXCLUDED.protocols,
+        joined_generation = EXCLUDED.joined_generation, last_heartbeat_at = now();
+    UPDATE topic.topic_groups t
+    SET protocol_type = group_join.protocol_type, pending_members = t.pending_members - group_join.member_id
+    WHERE t.group_name = g.group_name;
+    PERFORM topic.group_rebalance(g.group_name);
+    SELECT p.error, p.generation_id, p.protocol_name, p.leader_id, p.members
+    INTO error, generation_id, protocol_name, leader_id, members
+    FROM topic.group_join_poll(g.group_name, group_join.member_id) p;
+END
+$$;
+
+CREATE FUNCTION topic.group_sync_poll(group_name text, member_id text, generation int, OUT error text, OUT assignment jsonb)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    g topic.topic_groups;
+    me topic.topic_group_members;
+BEGIN
+    error := topic.group_enter(group_sync_poll.group_name);
+    IF error IS NOT NULL THEN
+        RETURN;
+    END IF;
+    SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = group_sync_poll.group_name;
+    UPDATE topic.topic_group_members m SET last_heartbeat_at = now()
+    WHERE m.group_name = g.group_name AND m.member_id = group_sync_poll.member_id
+    RETURNING * INTO me;
+    IF NOT FOUND THEN
+        error := 'UNKNOWN_MEMBER_ID';
+    ELSIF generation <> g.generation_id THEN
+        error := 'ILLEGAL_GENERATION';
+    ELSIF g.state = 'PreparingRebalance' THEN
+        error := 'REBALANCE_IN_PROGRESS';
+    ELSIF g.state = 'Stable' THEN
+        error := 'NONE';
+        assignment := me.assignment;
+    END IF;
+END
+$$;
+
+CREATE FUNCTION topic.group_sync(group_name text, member_id text, generation int, assignments jsonb,
+    OUT error text, OUT assignment jsonb)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    g topic.topic_groups;
+BEGIN
+    error := topic.group_enter(group_sync.group_name);
+    IF error IS NOT NULL THEN
+        RETURN;
+    END IF;
+    SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = group_sync.group_name;
+    IF g.state = 'CompletingRebalance' AND g.generation_id = generation AND g.leader_member_id = group_sync.member_id THEN
+        UPDATE topic.topic_group_members m SET assignment = assignments -> m.member_id WHERE m.group_name = g.group_name;
+        UPDATE topic.topic_groups t SET state = 'Stable', updated_at = now() WHERE t.group_name = g.group_name;
+        PERFORM pg_notify('pg_topics_group', g.group_name);
+    END IF;
+    SELECT p.error, p.assignment INTO error, assignment
+    FROM topic.group_sync_poll(g.group_name, group_sync.member_id, generation) p;
+END
+$$;
+
+CREATE FUNCTION topic.group_heartbeat(group_name text, member_id text, generation int) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    err text := topic.group_enter(group_heartbeat.group_name);
+    g topic.topic_groups;
+BEGIN
+    IF err IS NOT NULL THEN
+        RETURN err;
+    END IF;
+    UPDATE topic.topic_group_members m SET last_heartbeat_at = now()
+    WHERE m.group_name = group_heartbeat.group_name AND m.member_id = group_heartbeat.member_id;
+    IF NOT FOUND THEN
+        RETURN 'UNKNOWN_MEMBER_ID';
+    END IF;
+    SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = group_heartbeat.group_name;
+    IF generation <> g.generation_id THEN
+        RETURN 'ILLEGAL_GENERATION';
+    END IF;
+    IF g.state = 'PreparingRebalance' THEN
+        RETURN 'REBALANCE_IN_PROGRESS';
+    END IF;
+    RETURN 'NONE';
+END
+$$;
+
+CREATE FUNCTION topic.group_leave(group_name text, member_id text) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    err text := topic.group_enter(group_leave.group_name);
+BEGIN
+    IF err IS NOT NULL THEN
+        RETURN err;
+    END IF;
+    DELETE FROM topic.topic_group_members m
+    WHERE m.group_name = group_leave.group_name AND m.member_id = group_leave.member_id;
+    IF NOT FOUND THEN
+        RETURN 'UNKNOWN_MEMBER_ID';
+    END IF;
+    PERFORM topic.group_rebalance(group_leave.group_name);
+    RETURN 'NONE';
+END
+$$;
+
+CREATE FUNCTION topic.commit_offset(topic text, group_name text, band int, new_offset bigint, generation int) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    s text := split_part(commit_offset.topic, '.', 1);
+    t text := substr(commit_offset.topic, length(s) + 2);
+    queue regclass := to_regclass(format('%I.%I', s, t));
+    err text;
+    n bigint;
+    k int;
+    current_generation int;
+    stored bigint;
+BEGIN
+    IF starts_with(commit_offset.group_name, '__pg_topics_sync:') THEN
+        RETURN 'INVALID_GROUP_ID';
+    END IF;
+    err := topic.group_enter(commit_offset.group_name);
+    IF err IS NOT NULL THEN
+        RETURN err;
+    END IF;
+    IF queue IS NOT NULL AND NOT has_table_privilege(topic.caller(), queue, 'SELECT') THEN
+        RETURN 'TOPIC_AUTHORIZATION_FAILED';
+    END IF;
+    IF new_offset IS NULL OR new_offset < 0 THEN
+        RETURN 'OFFSET_OUT_OF_RANGE';
+    END IF;
+    n := least(new_offset, (SELECT p.next_offset FROM topic.topic_band_position p
+                            WHERE p.schema_name = s AND p.topic = t AND p.band = commit_offset.band));
+    BEGIN
+        INSERT INTO topic.topic_offsets AS o
+            (schema_name, topic, group_name, band, owner_role, committed_offset, generation_id)
+        SELECT s, t, g.group_name, commit_offset.band, g.owner_role, n, g.generation_id
+        FROM topic.topic_groups g
+        WHERE g.group_name = commit_offset.group_name
+          AND (g.generation_id = commit_offset.generation OR (commit_offset.generation = -1 AND g.state = 'Empty'))
+        ON CONFLICT ON CONSTRAINT topic_offsets_pkey DO UPDATE
+        SET committed_offset = EXCLUDED.committed_offset, generation_id = EXCLUDED.generation_id
+        WHERE o.generation_id <= EXCLUDED.generation_id
+          AND (o.committed_offset < EXCLUDED.committed_offset OR commit_offset.generation = -1);
+        GET DIAGNOSTICS k = ROW_COUNT;
+    EXCEPTION WHEN foreign_key_violation OR numeric_value_out_of_range THEN
+        RETURN 'UNKNOWN_TOPIC_OR_PARTITION';
+    END;
+    IF k = 1 THEN
+        RETURN 'NONE';
+    END IF;
+    SELECT g.generation_id INTO current_generation FROM topic.topic_groups g WHERE g.group_name = commit_offset.group_name;
+    SELECT o.committed_offset INTO stored FROM topic.topic_offsets o
+    WHERE o.schema_name = s AND o.topic = t AND o.group_name = commit_offset.group_name AND o.band = commit_offset.band;
+    IF current_generation = commit_offset.generation AND stored >= n THEN
+        RETURN 'NONE';
+    END IF;
+    RETURN 'ILLEGAL_GENERATION';
+END
+$$;
+
+CREATE FUNCTION topic.fetch_offset(topic text, group_name text, band int) RETURNS bigint
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    s text := split_part(fetch_offset.topic, '.', 1);
+    t text := substr(fetch_offset.topic, length(s) + 2);
+    queue regclass := to_regclass(format('%I.%I', s, t));
+    group_owner name;
+BEGIN
+    SELECT g.owner_role INTO group_owner FROM topic.topic_groups g WHERE g.group_name = fetch_offset.group_name;
+    IF NOT pg_has_role(topic.caller(), group_owner, 'member')
+       OR (queue IS NOT NULL AND NOT has_table_privilege(topic.caller(), queue, 'SELECT')) THEN
+        RAISE EXCEPTION 'topic.fetch_offset: role % may not read group % on topic %',
+            topic.caller(), fetch_offset.group_name, fetch_offset.topic USING ERRCODE = '42501';
+    END IF;
+    RETURN (SELECT o.committed_offset FROM topic.topic_offsets o
+            WHERE o.schema_name = s AND o.topic = t AND o.group_name = fetch_offset.group_name AND o.band = fetch_offset.band);
+END
+$$;
+
+CREATE FUNCTION topic.delete_group(group_name text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    err text;
+BEGIN
+    IF starts_with(delete_group.group_name, '__pg_topics_sync:') THEN
+        RAISE EXCEPTION 'topic.delete_group: the group name % is reserved for the sync', delete_group.group_name
+            USING ERRCODE = '42501';
+    END IF;
+    err := topic.group_enter(delete_group.group_name);
+    IF err = 'UNKNOWN_MEMBER_ID' THEN
+        RAISE EXCEPTION 'topic.delete_group: group % does not exist', delete_group.group_name USING ERRCODE = '42704';
+    END IF;
+    IF err = 'GROUP_AUTHORIZATION_FAILED' THEN
+        RAISE EXCEPTION 'topic.delete_group: role % may not delete group %', topic.caller(), delete_group.group_name
+            USING ERRCODE = '42501';
+    END IF;
+    IF EXISTS (SELECT FROM topic.topic_group_members m WHERE m.group_name = delete_group.group_name) THEN
+        RAISE EXCEPTION 'topic.delete_group: group % has members', delete_group.group_name USING ERRCODE = '55006';
+    END IF;
+    DELETE FROM topic.topic_groups g WHERE g.group_name = delete_group.group_name;
 END
 $$;
 
@@ -546,5 +1169,12 @@ REVOKE EXECUTE ON FUNCTION topic.retention_next(text, text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.reap() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.check_duplicates(text, text, boolean) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.sync_topic(text, text, int) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.sync_base_owner(regclass, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.owned_topic(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.group_rebalance(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.expire_members(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.group_protocol(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.group_enter(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.expire_groups() FROM PUBLIC;
 CREATE EVENT TRIGGER pg_topics_ddl_end ON ddl_command_end EXECUTE FUNCTION topic.ddl_end();
 CREATE EVENT TRIGGER pg_topics_sql_drop ON sql_drop EXECUTE FUNCTION topic.sql_drop();

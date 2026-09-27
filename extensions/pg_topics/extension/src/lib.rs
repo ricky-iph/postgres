@@ -22,6 +22,9 @@ extension_sql_file!("../sql/pg_topics.sql", finalize);
 static FAILOVER_IS_FENCED: GucSetting<bool> = GucSetting::<bool>::new(false);
 static DATABASES: GucSetting<Option<&'static CStr>> =
     GucSetting::<Option<&'static CStr>>::new(None);
+static GROUP_MIN_SESSION_MS: GucSetting<i32> = GucSetting::<i32>::new(6000);
+static GROUP_MAX_SESSION_MS: GucSetting<i32> = GucSetting::<i32>::new(1_800_000);
+static GROUP_INITIAL_REBALANCE_DELAY_MS: GucSetting<i32> = GucSetting::<i32>::new(3000);
 const STAMP_LOCK: i32 = 0x7067_7473;
 
 #[pg_extern(immutable, strict)]
@@ -568,6 +571,36 @@ pub extern "C" fn _PG_init() {
         "A comma list of database names. A change needs a server restart.",
         &DATABASES,
         GucContext::Postmaster,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_topics.group_min_session_ms",
+        "The lowest session timeout in ms that a group member may ask for.",
+        "topic.group_join refuses a lower session_ms with INVALID_SESSION_TIMEOUT.",
+        &GROUP_MIN_SESSION_MS,
+        1,
+        i32::MAX,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_topics.group_max_session_ms",
+        "The highest session timeout in ms that a group member may ask for.",
+        "topic.group_join refuses a higher session_ms with INVALID_SESSION_TIMEOUT.",
+        &GROUP_MAX_SESSION_MS,
+        1,
+        i32::MAX,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        "pg_topics.group_initial_rebalance_delay_ms",
+        "The longest time in ms that the first join window of an empty group stays open.",
+        "The window closes at the lower of this value and the largest rebalance_ms of the members.",
+        &GROUP_INITIAL_REBALANCE_DELAY_MS,
+        0,
+        i32::MAX,
+        GucContext::Suset,
         GucFlags::default(),
     );
     let list = DATABASES
@@ -1156,9 +1189,12 @@ mod tests {
                     ('old_member', 'postgres', 'Empty', now() - interval '2 hours'),
                     ('old_forever', 'postgres', 'Empty', now() - interval '2 hours'),
                     ('old_no_offsets', 'postgres', 'Empty', now() - interval '2 hours'),
+                    ('day_old_no_offsets', 'postgres', 'Empty', now() - interval '25 hours'),
+                    ('day_old_member', 'postgres', 'Empty', now() - interval '25 hours'),
+                    ('day_old_stable', 'postgres', 'Stable', now() - interval '25 hours'),
                     ('__pg_topics_sync:public.reaped_q', 'postgres', 'Empty', now() - interval '2 hours');
              INSERT INTO topic.topic_group_members (group_name, member_id, owner_role, session_timeout_ms, rebalance_ms)
-             VALUES ('old_member', 'm', 'postgres', 6000, 6000);
+             VALUES ('old_member', 'm', 'postgres', 6000, 6000), ('day_old_member', 'm', 'postgres', 6000, 6000);
              INSERT INTO topic.topic_offsets (schema_name, topic, group_name, band, owner_role)
              SELECT 'public', 'reaped_q', g, 0, 'postgres'
              FROM unnest(ARRAY['old_empty', 'new_empty', 'old_stable', 'old_member', 'old_forever',
@@ -1181,6 +1217,8 @@ mod tests {
             Some(
                 [
                     "__pg_topics_sync:public.reaped_q",
+                    "day_old_member",
+                    "day_old_stable",
                     "new_empty",
                     "old_forever",
                     "old_member",
@@ -1212,6 +1250,635 @@ mod tests {
         assert_eq!(
             one::<Vec<i64>>("SELECT ARRAY[count(*), count(log_offset)] FROM pgt_rls.hidden_q"),
             Some(vec![3, 0])
+        );
+    }
+
+    fn state_of(sql: &str) -> Option<String> {
+        Spi::run(
+            "DO $do$ BEGIN
+             IF to_regprocedure('pg_temp.state_of(text)') IS NULL THEN
+                 CREATE FUNCTION pg_temp.state_of(q text) RETURNS text LANGUAGE plpgsql AS $$
+                 BEGIN EXECUTE q; RETURN NULL; EXCEPTION WHEN OTHERS THEN RETURN SQLSTATE; END $$;
+             END IF;
+             END $do$",
+        )
+        .unwrap();
+        Spi::get_one_with_args::<String>(
+            "SELECT pg_temp.state_of($1)",
+            vec![(PgBuiltInOids::TEXTOID.oid(), sql.into_datum())],
+        )
+        .unwrap()
+    }
+
+    fn member(group: &str) -> String {
+        one::<String>(&format!(
+            r#"SELECT concat_ws('/', error, member_id) FROM topic.group_join('{group}', '', 'client', 10000, 60000,
+                   'consumer', '[{{"name": "range"}}]')"#
+        ))
+        .unwrap()
+        .strip_prefix("MEMBER_ID_REQUIRED/")
+        .unwrap()
+        .to_string()
+    }
+
+    fn join(group: &str, member: &str, session_ms: i32) -> Option<String> {
+        one::<String>(&format!(
+            r#"SELECT concat_ws('/', coalesce(error, 'WAIT'), generation_id, jsonb_array_length(members))
+               FROM topic.group_join('{group}', '{member}', 'client', {session_ms}, 60000, 'consumer',
+                                     '[{{"name": "range", "metadata": "{member}"}}]')"#
+        ))
+    }
+
+    fn poll(group: &str, member: &str) -> Option<String> {
+        one::<String>(&format!(
+            "SELECT concat_ws('/', coalesce(error, 'WAIT'), generation_id, jsonb_array_length(members))
+             FROM topic.group_join_poll('{group}', '{member}')"
+        ))
+    }
+
+    fn time_out_window(group: &str) {
+        Spi::run(&format!(
+            "UPDATE topic.topic_groups SET rebalance_started_at = now() - interval '1 hour'
+             WHERE group_name = '{group}'"
+        ))
+        .unwrap();
+    }
+
+    fn commit(topic: &str, group: &str, band: i32, offset: i64, generation: i32) -> Option<String> {
+        one::<String>(&format!(
+            "SELECT topic.commit_offset('{topic}', '{group}', {band}, {offset}, {generation})"
+        ))
+    }
+
+    #[pg_test]
+    fn control_plane_refuses_non_owner_serves_owner_members() {
+        tenant("pgt_cp_owner");
+        Spi::run("CREATE ROLE pgt_cp_member IN ROLE pgt_cp_owner; CREATE ROLE pgt_cp_other")
+            .unwrap();
+        Spi::run("SET LOCAL ROLE pgt_cp_owner").unwrap();
+        for t in ["kegs", "casks"] {
+            Spi::run(&format!(
+                r#"SELECT topic.create_table_topic('pgt_cp_owner.{t}', '{{"id": "int"}}', 'id', 1);
+                   CREATE TABLE pgt_cp_owner.{t}2 (id int PRIMARY KEY, event_at timestamptz NOT NULL);
+                   SELECT topic.group_join('pgt_cp_{t}', '', 'client', 10000, 1000, 'consumer', '[{{"name": "range"}}]');"#
+            ))
+            .unwrap();
+        }
+        Spi::run("RESET ROLE").unwrap();
+        let ops = |t: &str| {
+            [
+                format!("SELECT topic.set_retention('pgt_cp_owner.{t}_q', '1 day')"),
+                format!("SELECT topic.set_backlog_limit('pgt_cp_owner.{t}_q', '30 seconds')"),
+                format!("SELECT topic.set_durability('pgt_cp_owner.{t}_q', 'relaxed')"),
+                format!("SELECT topic.set_sync_enabled('pgt_cp_owner.{t}_q', false)"),
+                format!("SELECT topic.set_sync('pgt_cp_owner.{t}_q', 'pgt_cp_owner.{t}2', 'id')"),
+                format!("SELECT topic.delete_group('pgt_cp_{t}')"),
+                format!("SELECT topic.drop_topic('pgt_cp_owner.{t}_q')"),
+            ]
+        };
+        let run_as = |role: &str, sqls: &[String]| -> Vec<Option<String>> {
+            Spi::run(&format!("SET LOCAL ROLE {role}")).unwrap();
+            let states = sqls.iter().map(|sql| state_of(sql)).collect();
+            Spi::run("RESET ROLE").unwrap();
+            states
+        };
+        let config = |t: &str| {
+            one::<String>(&format!(
+                "SELECT concat_ws('/', retention_interval, max_backlog_age, min_durability, sync_enabled, sync_table,
+                                  (SELECT count(*) FROM topic.topic_groups WHERE group_name = 'pgt_cp_{t}'))
+                 FROM topic.topic_config WHERE schema_name = 'pgt_cp_owner' AND topic = '{t}_q'"
+            ))
+        };
+        assert_eq!(
+            run_as("pgt_cp_other", &ops("kegs")),
+            vec![Some("42501".to_string()); 7]
+        );
+        assert_eq!(
+            config("kegs"),
+            Some("7 days/00:01:00/durable/t/pgt_cp_owner.kegs/1".into())
+        );
+        for (role, t) in [("pgt_cp_member", "kegs"), ("pgt_cp_owner", "casks")] {
+            let [before_drop @ .., drop] = ops(t);
+            assert_eq!(run_as(role, &before_drop), vec![None; 6], "{role}");
+            assert_eq!(
+                config(t),
+                Some(format!("1 day/00:00:30/relaxed/f/pgt_cp_owner.{t}2/0"))
+            );
+            assert_eq!(run_as(role, &[drop]), vec![None], "{role}");
+            assert_eq!(
+                one::<bool>(&format!("SELECT to_regclass('pgt_cp_owner.{t}_q') IS NULL")),
+                Some(true)
+            );
+        }
+    }
+
+    #[pg_test]
+    fn drop_topic_removes_table_partitions_and_control_rows() {
+        Spi::run(
+            "SELECT topic.create_topic('public.dropped_q', 2);
+             SELECT topic.publish('public.dropped_q', '{}') FROM generate_series(1, 4);
+             SELECT topic.stamp_topic('public', 'dropped_q');
+             INSERT INTO topic.topic_groups (group_name, owner_role, generation_id, state)
+             VALUES ('pgt_dropped', current_user, 1, 'Stable');
+             INSERT INTO topic.topic_producers
+                 (schema_name, topic, producer_id, producer_epoch, band, slot, first_sequence, last_sequence, base_offset)
+             VALUES ('public', 'dropped_q', 1, 0, 0, 0, 0, 0, -1);",
+        )
+        .unwrap();
+        assert_eq!(
+            commit("public.dropped_q", "pgt_dropped", 0, 2, 1),
+            Some("NONE".into())
+        );
+        Spi::run("SELECT topic.drop_topic('public.dropped_q')").unwrap();
+        assert_eq!(
+            one::<Vec<i64>>(
+                "SELECT ARRAY[
+                     (SELECT count(*) FROM pg_class WHERE relname LIKE 'dropped\\_q%'),
+                     (SELECT count(*) FROM topic.topic_config WHERE topic = 'dropped_q'),
+                     (SELECT count(*) FROM topic.topic_band_position WHERE topic = 'dropped_q'),
+                     (SELECT count(*) FROM topic.topic_offsets WHERE topic = 'dropped_q'),
+                     (SELECT count(*) FROM topic.topic_producers WHERE topic = 'dropped_q'),
+                     (SELECT count(*) FROM topic.topic_groups WHERE group_name = 'pgt_dropped')]"
+            ),
+            Some(vec![0, 0, 0, 0, 0, 1])
+        );
+    }
+
+    #[pg_test]
+    fn fetch_orders_filters_and_refuses_below_oldest() {
+        Spi::run(
+            "SELECT topic.create_topic('public.fetched_q', 1);
+             SELECT topic.publish('public.fetched_q', jsonb_build_object('i', i, 'odd', i % 2 = 1))
+             FROM generate_series(1, 5) i;
+             SELECT topic.stamp_topic('public', 'fetched_q');",
+        )
+        .unwrap();
+        let offsets = |call: &str| {
+            one::<Vec<i64>>(&format!(
+                "SELECT coalesce(array_agg(log_offset), '{{}}') FROM topic.fetch('public.fetched_q', {call})"
+            ))
+        };
+        assert_eq!(offsets("0, 0"), Some(vec![0, 1, 2, 3, 4]));
+        assert_eq!(offsets("0, 2, 2"), Some(vec![2, 3]));
+        assert_eq!(
+            offsets(r#"0, 0, filter => '{"odd": true}'"#),
+            Some(vec![0, 2, 4])
+        );
+        assert_eq!(
+            one::<Vec<i64>>(
+                "SELECT ARRAY[topic.offset_for_time('public.fetched_q', 0,
+                                  (SELECT published_at FROM public.fetched_q WHERE log_offset = 3)),
+                              coalesce(topic.offset_for_time('public.fetched_q', 0, now() + interval '1 day'), -1)]"
+            ),
+            Some(vec![3, -1])
+        );
+        Spi::run(
+            "UPDATE topic.topic_band_position SET oldest_offset = 2 WHERE topic = 'fetched_q'",
+        )
+        .unwrap();
+        assert_eq!(
+            state_of("SELECT * FROM topic.fetch('public.fetched_q', 0, 1)"),
+            Some("PT001".into())
+        );
+        assert_eq!(offsets("0, 2"), Some(vec![2, 3, 4]));
+        assert_eq!(
+            state_of("SELECT * FROM topic.fetch('public.fetched_q', 1, 0)"),
+            Some("42P01".into())
+        );
+        Spi::run("CREATE ROLE pgt_fetch_none").unwrap();
+        Spi::run("SET LOCAL ROLE pgt_fetch_none").unwrap();
+        let refused = state_of("SELECT * FROM topic.band_offsets('public.fetched_q')");
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(refused, Some("42501".into()));
+    }
+
+    #[pg_test]
+    fn commit_offset_is_fenced_by_generation() {
+        Spi::run(
+            "SELECT topic.create_topic('public.fenced_q', 1);
+             SELECT topic.publish('public.fenced_q', '{}') FROM generate_series(1, 20);
+             SELECT topic.stamp_topic('public', 'fenced_q');
+             INSERT INTO topic.topic_groups (group_name, owner_role, generation_id, state)
+             VALUES ('pgt_fence', current_user, 5, 'Stable');",
+        )
+        .unwrap();
+        let stored = || {
+            one::<String>(
+                "SELECT committed_offset || '@' || generation_id FROM topic.topic_offsets WHERE group_name = 'pgt_fence'",
+            )
+        };
+        let c = |offset: i64, generation: i32| {
+            commit("public.fenced_q", "pgt_fence", 0, offset, generation)
+        };
+        assert_eq!(c(10, 5), Some("NONE".into()));
+        assert_eq!(c(12, 4), Some("ILLEGAL_GENERATION".into()));
+        assert_eq!(c(10, 5), Some("NONE".into()));
+        assert_eq!(c(8, 5), Some("NONE".into()));
+        assert_eq!(stored(), Some("10@5".into()));
+        Spi::run("UPDATE topic.topic_groups SET generation_id = 6 WHERE group_name = 'pgt_fence'")
+            .unwrap();
+        assert_eq!(c(10, 5), Some("ILLEGAL_GENERATION".into()));
+        assert_eq!(c(8, 5), Some("ILLEGAL_GENERATION".into()));
+        assert_eq!(c(15, 6), Some("NONE".into()));
+        assert_eq!(stored(), Some("15@6".into()));
+        assert_eq!(c(100, 6), Some("NONE".into()));
+        assert_eq!(stored(), Some("20@6".into()));
+        assert_eq!(
+            one::<i64>("SELECT topic.fetch_offset('public.fenced_q', 'pgt_fence', 0)"),
+            Some(20)
+        );
+        assert_eq!(
+            commit("public.fenced_q", "pgt_fence", 7, 1, 6),
+            Some("UNKNOWN_TOPIC_OR_PARTITION".into())
+        );
+        assert_eq!(
+            commit("public.nothing_q", "pgt_fence", 0, 1, 6),
+            Some("UNKNOWN_TOPIC_OR_PARTITION".into())
+        );
+        Spi::run("CREATE ROLE pgt_fence_other").unwrap();
+        Spi::run("SET LOCAL ROLE pgt_fence_other").unwrap();
+        let refused = c(1, 6);
+        let read = state_of("SELECT topic.fetch_offset('public.fenced_q', 'pgt_fence', 0)");
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(
+            (refused, read),
+            (
+                Some("GROUP_AUTHORIZATION_FAILED".into()),
+                Some("42501".into())
+            )
+        );
+        assert_eq!(stored(), Some("20@6".into()));
+        for bad in ["NULL", "-1"] {
+            assert_eq!(
+                one::<String>(&format!(
+                    "SELECT topic.commit_offset('public.fenced_q', 'pgt_fence', 0, {bad}, 6)"
+                )),
+                Some("OFFSET_OUT_OF_RANGE".into()),
+                "{bad}"
+            );
+        }
+        assert_eq!(stored(), Some("20@6".into()));
+        Spi::run(
+            "INSERT INTO topic.topic_groups (group_name, owner_role) VALUES ('__pg_topics_sync:public.fenced_q', current_user)",
+        )
+        .unwrap();
+        assert_eq!(
+            commit(
+                "public.fenced_q",
+                "__pg_topics_sync:public.fenced_q",
+                0,
+                5,
+                0
+            ),
+            Some("INVALID_GROUP_ID".into())
+        );
+        assert_eq!(
+            one::<i64>(
+                "SELECT count(*) FROM topic.topic_offsets WHERE group_name LIKE '\\_\\_pg%'"
+            ),
+            Some(0)
+        );
+    }
+
+    #[pg_test]
+    fn offsets_need_select_on_the_topic() {
+        Spi::run(
+            "SELECT topic.create_topic('public.secret_q', 1);
+             SELECT topic.publish('public.secret_q', '{}') FROM generate_series(1, 3);
+             SELECT topic.stamp_topic('public', 'secret_q');
+             CREATE ROLE pgt_snoop;
+             INSERT INTO topic.topic_groups (group_name, owner_role, generation_id, state)
+             VALUES ('pgt_snoop', 'pgt_snoop', 1, 'Stable');",
+        )
+        .unwrap();
+        let as_snoop = || {
+            Spi::run("SET LOCAL ROLE pgt_snoop").unwrap();
+            let r = (
+                commit("public.secret_q", "pgt_snoop", 0, 100, 1),
+                state_of("SELECT topic.fetch_offset('public.secret_q', 'pgt_snoop', 0)"),
+            );
+            Spi::run("RESET ROLE").unwrap();
+            r
+        };
+        assert_eq!(
+            as_snoop(),
+            (
+                Some("TOPIC_AUTHORIZATION_FAILED".into()),
+                Some("42501".into())
+            )
+        );
+        assert_eq!(
+            one::<i64>("SELECT count(*) FROM topic.topic_offsets WHERE group_name = 'pgt_snoop'"),
+            Some(0)
+        );
+        Spi::run("GRANT SELECT ON public.secret_q TO pgt_snoop").unwrap();
+        assert_eq!(as_snoop(), (Some("NONE".into()), None));
+    }
+
+    #[pg_test]
+    fn admin_commit_moves_an_empty_group_to_any_offset() {
+        Spi::run(
+            "SELECT topic.create_topic('public.reset_q', 1);
+             SELECT topic.publish('public.reset_q', '{}') FROM generate_series(1, 20);
+             SELECT topic.stamp_topic('public', 'reset_q');
+             INSERT INTO topic.topic_groups (group_name, owner_role, generation_id, state)
+             VALUES ('pgt_reset', current_user, 4, 'Empty');",
+        )
+        .unwrap();
+        let stored = || {
+            one::<String>(
+                "SELECT committed_offset || '@' || generation_id FROM topic.topic_offsets WHERE group_name = 'pgt_reset'",
+            )
+        };
+        let c = |offset: i64, generation: i32| {
+            commit("public.reset_q", "pgt_reset", 0, offset, generation)
+        };
+        assert_eq!(c(10, 4), Some("NONE".into()));
+        assert_eq!(c(3, 4), Some("NONE".into()));
+        assert_eq!(stored(), Some("10@4".into()));
+        assert_eq!(c(3, -1), Some("NONE".into()));
+        assert_eq!(stored(), Some("3@4".into()));
+        assert_eq!(c(99, -1), Some("NONE".into()));
+        assert_eq!(stored(), Some("20@4".into()));
+        assert_eq!(c(-1, -1), Some("OFFSET_OUT_OF_RANGE".into()));
+        Spi::run("UPDATE topic.topic_groups SET state = 'Stable' WHERE group_name = 'pgt_reset'")
+            .unwrap();
+        assert_eq!(c(1, -1), Some("ILLEGAL_GENERATION".into()));
+        assert_eq!(stored(), Some("20@4".into()));
+    }
+
+    #[pg_test]
+    fn fetch_offset_only_reads() {
+        let [a, b] = [member("pgt_read"), member("pgt_read")];
+        assert_eq!(join("pgt_read", &a, 6000), Some("WAIT".into()));
+        assert_eq!(join("pgt_read", &b, 6000), Some("WAIT".into()));
+        Spi::run(&format!(
+            "UPDATE topic.topic_group_members SET last_heartbeat_at = now() - interval '1 minute' WHERE member_id = '{b}';
+             UPDATE topic.topic_groups SET rebalance_started_at = now() - interval '1 hour' WHERE group_name = 'pgt_read'"
+        ))
+        .unwrap();
+        assert_eq!(
+            one::<i64>("SELECT coalesce(topic.fetch_offset('public.none_q', 'pgt_read', 0), -1)"),
+            Some(-1)
+        );
+        assert_eq!(
+            one::<String>(
+                "SELECT concat_ws('/', state, generation_id, expired_members,
+                                  (SELECT count(*) FROM topic.topic_group_members WHERE group_name = 'pgt_read'))
+                 FROM topic.topic_groups WHERE group_name = 'pgt_read'"
+            ),
+            Some("PreparingRebalance/0/0/2".into())
+        );
+    }
+
+    #[pg_test]
+    fn expire_groups_rebalances_a_group_nobody_calls() {
+        Spi::run(
+            "INSERT INTO topic.topic_groups (group_name, owner_role, generation_id, state, leader_member_id)
+             VALUES ('pgt_idle', current_user, 1, 'Stable', 'a'), ('pgt_alive', current_user, 1, 'Stable', 'c');
+             INSERT INTO topic.topic_group_members
+                 (group_name, member_id, owner_role, session_timeout_ms, rebalance_ms, joined_generation, last_heartbeat_at)
+             VALUES ('pgt_idle', 'a', current_user, 6000, 1000, 0, now() - interval '7 seconds'),
+                    ('pgt_idle', 'b', current_user, 6000, 1000, 0, now()),
+                    ('pgt_alive', 'c', current_user, 20000, 1000, 0, now() - interval '7 seconds');
+             SELECT topic.expire_groups();",
+        )
+        .unwrap();
+        assert_eq!(
+            one::<Vec<String>>(
+                "SELECT array_agg(concat_ws('/', group_name, state, expired_members) ORDER BY group_name)
+                 FROM topic.topic_groups WHERE group_name IN ('pgt_idle', 'pgt_alive')"
+            ),
+            Some(vec![
+                "pgt_alive/Stable/0".to_string(),
+                "pgt_idle/PreparingRebalance/1".to_string()
+            ])
+        );
+    }
+
+    #[pg_test]
+    fn a_first_commit_with_a_wrong_generation_writes_nothing() {
+        Spi::run(
+            "SELECT topic.create_topic('public.first_q', 1);
+             INSERT INTO topic.topic_groups (group_name, owner_role, generation_id, state)
+             VALUES ('pgt_first', current_user, 3, 'Stable');",
+        )
+        .unwrap();
+        assert_eq!(
+            commit("public.first_q", "pgt_first", 0, 0, 2),
+            Some("ILLEGAL_GENERATION".into())
+        );
+        assert_eq!(
+            commit("public.first_q", "pgt_first", 0, 0, 4),
+            Some("ILLEGAL_GENERATION".into())
+        );
+        assert_eq!(
+            one::<i64>("SELECT count(*) FROM topic.topic_offsets WHERE group_name = 'pgt_first'"),
+            Some(0)
+        );
+    }
+
+    #[pg_test]
+    fn join_window_waits_for_every_member_or_the_timeout() {
+        let ids = [
+            member("pgt_window"),
+            member("pgt_window"),
+            member("pgt_window"),
+        ];
+        let [a, b, c] = [&ids[0], &ids[1], &ids[2]];
+        for m in &ids {
+            assert_eq!(join("pgt_window", m, 10000), Some("WAIT".into()));
+        }
+        assert_eq!(poll("pgt_window", a), Some("WAIT".into()));
+        time_out_window("pgt_window");
+        let first: Vec<String> = ids.iter().map(|m| poll("pgt_window", m).unwrap()).collect();
+        assert_eq!(
+            first.iter().filter(|r| *r == "NONE/1/3").count(),
+            1,
+            "{first:?}"
+        );
+        assert_eq!(
+            first.iter().filter(|r| *r == "NONE/1/0").count(),
+            2,
+            "{first:?}"
+        );
+        assert_eq!(
+            one::<String>(
+                "SELECT concat_ws('/', state, generation_id, protocol_name) FROM topic.topic_groups
+                 WHERE group_name = 'pgt_window'"
+            ),
+            Some("CompletingRebalance/1/range".into())
+        );
+        let d = member("pgt_window");
+        assert_eq!(join("pgt_window", &d, 10000), Some("WAIT".into()));
+        assert_eq!(join("pgt_window", a, 10000), Some("WAIT".into()));
+        assert_eq!(join("pgt_window", b, 10000), Some("WAIT".into()));
+        assert_eq!(poll("pgt_window", a), Some("WAIT".into()));
+        let closing = join("pgt_window", c, 10000).unwrap();
+        let second: Vec<String> = [a, b, &d]
+            .iter()
+            .map(|m| poll("pgt_window", m).unwrap())
+            .chain([closing])
+            .collect();
+        assert_eq!(
+            second.iter().filter(|r| *r == "NONE/2/4").count(),
+            1,
+            "{second:?}"
+        );
+        assert_eq!(
+            second.iter().filter(|r| *r == "NONE/2/0").count(),
+            3,
+            "{second:?}"
+        );
+        let follower = one::<String>(&format!(
+            "SELECT member_id FROM topic.topic_group_members
+             WHERE group_name = 'pgt_window' AND member_id IN ('{a}', '{b}')
+               AND member_id <> (SELECT leader_member_id FROM topic.topic_groups WHERE group_name = 'pgt_window')
+             LIMIT 1"
+        ))
+        .unwrap();
+        assert_eq!(
+            join("pgt_window", &follower, 10000),
+            Some("NONE/2/0".into())
+        );
+        assert_eq!(
+            one::<String>(
+                "SELECT state || '/' || generation_id FROM topic.topic_groups WHERE group_name = 'pgt_window'"
+            ),
+            Some("CompletingRebalance/2".into())
+        );
+    }
+
+    #[pg_test]
+    fn a_member_with_an_old_heartbeat_is_expired() {
+        let [a, b, c] = [
+            member("pgt_expiry"),
+            member("pgt_expiry"),
+            member("pgt_expiry"),
+        ];
+        assert_eq!(join("pgt_expiry", &a, 6000), Some("WAIT".into()));
+        assert_eq!(join("pgt_expiry", &b, 6000), Some("WAIT".into()));
+        assert_eq!(join("pgt_expiry", &c, 20000), Some("WAIT".into()));
+        time_out_window("pgt_expiry");
+        for m in [&a, &b, &c] {
+            assert!(poll("pgt_expiry", m).unwrap().starts_with("NONE/1/"));
+        }
+        let leader = one::<String>(
+            "SELECT leader_member_id FROM topic.topic_groups WHERE group_name = 'pgt_expiry'",
+        )
+        .unwrap();
+        assert_eq!(
+            one::<String>(&format!(
+                r#"SELECT error FROM topic.group_sync('pgt_expiry', '{leader}', 1,
+                       '{{"{a}": [0], "{b}": [1], "{c}": [2]}}')"#
+            )),
+            Some("NONE".into())
+        );
+        assert_eq!(
+            one::<String>(&format!(
+                "SELECT error || ' ' || assignment FROM topic.group_sync_poll('pgt_expiry', '{b}', 1)"
+            )),
+            Some("NONE [1]".into())
+        );
+        let survivor = if leader == b { &a } else { &leader };
+        Spi::run(&format!(
+            "UPDATE topic.topic_group_members SET last_heartbeat_at = now() - interval '10 seconds'
+             WHERE group_name = 'pgt_expiry' AND member_id IN ('{b}', '{c}')"
+        ))
+        .unwrap();
+        assert_eq!(
+            one::<String>(&format!(
+                "SELECT topic.group_heartbeat('pgt_expiry', '{survivor}', 1)"
+            )),
+            Some("REBALANCE_IN_PROGRESS".into())
+        );
+        let mut kept = [a.clone(), c.clone()];
+        kept.sort();
+        assert_eq!(
+            one::<String>(
+                "SELECT concat_ws('/', state, expired_members,
+                                  (SELECT string_agg(member_id, ',' ORDER BY member_id COLLATE \"C\")
+                                   FROM topic.topic_group_members WHERE group_name = 'pgt_expiry'))
+                 FROM topic.topic_groups WHERE group_name = 'pgt_expiry'"
+            ),
+            Some(format!("PreparingRebalance/1/{}", kept.join(",")))
+        );
+    }
+
+    #[pg_test]
+    fn a_window_from_empty_closes_after_the_initial_delay() {
+        Spi::run("SET LOCAL pg_topics.group_initial_rebalance_delay_ms = 1000").unwrap();
+        let a = member("pgt_delay");
+        assert_eq!(join("pgt_delay", &a, 10000), Some("WAIT".into()));
+        Spi::run(
+            "UPDATE topic.topic_groups SET rebalance_started_at = now() - interval '900 milliseconds'
+             WHERE group_name = 'pgt_delay'",
+        )
+        .unwrap();
+        assert_eq!(poll("pgt_delay", &a), Some("WAIT".into()));
+        Spi::run(
+            "UPDATE topic.topic_groups SET rebalance_started_at = now() - interval '1100 milliseconds'
+             WHERE group_name = 'pgt_delay'",
+        )
+        .unwrap();
+        assert_eq!(poll("pgt_delay", &a), Some("NONE/1/1".into()));
+    }
+
+    #[pg_test]
+    fn group_join_refuses_the_sync_group_name_and_bad_requests() {
+        assert_eq!(
+            join("__pg_topics_sync:public.bottles_q", "a", 10000),
+            Some("INVALID_GROUP_ID".into())
+        );
+        assert_eq!(
+            state_of("SELECT topic.delete_group('__pg_topics_sync:public.bottles_q')"),
+            Some("42501".into())
+        );
+        assert_eq!(
+            join("pgt_bad", "a", 5999),
+            Some("INVALID_SESSION_TIMEOUT".into())
+        );
+        assert_eq!(
+            join("pgt_bad", "a", 1_800_001),
+            Some("INVALID_SESSION_TIMEOUT".into())
+        );
+        assert_eq!(
+            one::<i64>("SELECT count(*) FROM topic.topic_groups"),
+            Some(0)
+        );
+        for (session, rebalance) in [("NULL", "1000"), ("10000", "NULL"), ("10000", "-1")] {
+            assert_eq!(
+                one::<String>(&format!(
+                    r#"SELECT error FROM topic.group_join('pgt_bad', 'a', 'client', {session}, {rebalance},
+                           'consumer', '[{{"name": "range"}}]')"#
+                )),
+                Some("INVALID_SESSION_TIMEOUT".into()),
+                "{session} {rebalance}"
+            );
+        }
+        assert_eq!(
+            join("pgt_bad", "not-known", 10000),
+            Some("UNKNOWN_MEMBER_ID".into())
+        );
+        Spi::run("SET LOCAL pg_topics.group_min_session_ms = 1000").unwrap();
+        let a = member("pgt_bad");
+        assert_eq!(join("pgt_bad", &a, 1000), Some("WAIT".into()));
+        let late = member("pgt_bad");
+        Spi::run(&format!(
+            "UPDATE topic.topic_groups SET pending_members = pending_members || jsonb_build_object('{late}', now())
+             WHERE group_name = 'pgt_bad'"
+        ))
+        .unwrap();
+        assert_eq!(
+            join("pgt_bad", &late, 1000),
+            Some("UNKNOWN_MEMBER_ID".into())
+        );
+        assert_eq!(
+            one::<String>(
+                r#"SELECT error || ' ' || (member_id LIKE 'client-%') FROM topic.group_join('pgt_bad', '', 'client',
+                       10000, 1000, 'consumer', '[{"name": "range"}]')"#
+            ),
+            Some("MEMBER_ID_REQUIRED true".into())
         );
     }
 }

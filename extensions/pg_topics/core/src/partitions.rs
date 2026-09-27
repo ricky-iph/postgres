@@ -128,6 +128,10 @@ fn topics_tick(
             )?;
         }
     }
+    let expired = client
+        .execute("SELECT topic.expire_groups()", &[])
+        .map(drop);
+    report(client, warn, "group expiry", expired)?;
     let reaped = client.execute("SELECT topic.reap()", &[]).map(drop);
     report(client, warn, "reap", reaped)
 }
