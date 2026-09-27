@@ -1,6 +1,6 @@
 use kafka_protocol::messages::ApiKey;
 
-pub const VERSIONS: [(ApiKey, i16, i16); 7] = [
+pub const VERSIONS: [(ApiKey, i16, i16); 14] = [
     (ApiKey::ApiVersions, 0, 3),
     (ApiKey::SaslHandshake, 1, 1),
     (ApiKey::SaslAuthenticate, 0, 2),
@@ -8,6 +8,13 @@ pub const VERSIONS: [(ApiKey, i16, i16); 7] = [
     (ApiKey::Produce, 3, 9),
     (ApiKey::Fetch, 4, 12),
     (ApiKey::ListOffsets, 1, 7),
+    (ApiKey::FindCoordinator, 0, 4),
+    (ApiKey::JoinGroup, 0, 9),
+    (ApiKey::SyncGroup, 0, 5),
+    (ApiKey::Heartbeat, 0, 4),
+    (ApiKey::LeaveGroup, 0, 5),
+    (ApiKey::OffsetCommit, 2, 8),
+    (ApiKey::OffsetFetch, 1, 8),
 ];
 
 pub fn supported(key: ApiKey, version: i16) -> bool {
@@ -46,6 +53,6 @@ mod tests {
         assert!(!supported(ApiKey::Produce, 2));
         assert!(!supported(ApiKey::Produce, 10));
         assert!(!supported(ApiKey::SaslHandshake, 0));
-        assert!(!supported(ApiKey::JoinGroup, 0));
+        assert!(!supported(ApiKey::InitProducerId, 0));
     }
 }

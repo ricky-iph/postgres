@@ -406,7 +406,7 @@ pub fn produce(
 
 type BandOffsets = Result<Vec<(i32, i64, i64)>, i16>;
 
-fn band_offsets(db: &mut Client, topic: &str) -> Result<BandOffsets, Error> {
+pub(crate) fn band_offsets(db: &mut Client, topic: &str) -> Result<BandOffsets, Error> {
     match db.query(
         "SELECT band::int, oldest_offset, next_offset FROM topic.band_offsets($1)",
         &[&topic],
@@ -419,7 +419,7 @@ fn band_offsets(db: &mut Client, topic: &str) -> Result<BandOffsets, Error> {
     }
 }
 
-fn band_row(offsets: &BandOffsets, band: i32) -> Result<(i64, i64), i16> {
+pub(crate) fn band_row(offsets: &BandOffsets, band: i32) -> Result<(i64, i64), i16> {
     offsets
         .as_ref()
         .map_err(|code| *code)?

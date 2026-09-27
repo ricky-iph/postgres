@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::{
-    ApiKey, FetchRequest, ListOffsetsRequest, MetadataRequest, ProduceRequest, ResponseHeader,
-    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
+    ApiKey, FetchRequest, FindCoordinatorRequest, HeartbeatRequest, JoinGroupRequest,
+    LeaveGroupRequest, ListOffsetsRequest, MetadataRequest, OffsetCommitRequest,
+    OffsetFetchRequest, ProduceRequest, ResponseHeader, SaslAuthenticateRequest,
+    SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, SyncGroupRequest,
 };
 use kafka_protocol::protocol::{decode_request_header_from_buffer, Decodable, Encodable, StrBytes};
 use kafka_protocol::ResponseError;
@@ -17,14 +19,14 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
-use crate::handlers;
 use crate::versions::supported;
+use crate::{groups, handlers};
 
 const MAX_PENDING: usize = 64;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_SLACK: usize = 64 * 1024;
 const PREAUTH_FRAME_MAX: usize = 64 * 1024;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub struct Config {
     pub port: u16,
@@ -276,6 +278,54 @@ fn session(shared: &Arc<Shared>, pending: Slot, tcp: TcpStream) -> anyhow::Resul
                     version,
                     &handlers::list_offsets(client, &req)?,
                 )?)
+            }
+            (ApiKey::FindCoordinator, Some(_)) => {
+                let req = FindCoordinatorRequest::decode(&mut frame, version)?;
+                let body = groups::find_coordinator(&req, version, &cfg.advertised_host, cfg.port);
+                Some(response(id, key, version, &body)?)
+            }
+            (ApiKey::JoinGroup, Some((client, _))) => {
+                let req = JoinGroupRequest::decode(&mut frame, version)?;
+                let client_id = header.client_id.as_ref().map_or("", |c| c.as_str());
+                let body = groups::join_group(client, &req, version, client_id)?;
+                Some(response(id, key, version, &body)?)
+            }
+            (ApiKey::SyncGroup, Some((client, _))) => {
+                let req = SyncGroupRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &groups::sync_group(client, &req)?,
+                )?)
+            }
+            (ApiKey::Heartbeat, Some((client, _))) => {
+                let req = HeartbeatRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &groups::heartbeat(client, &req)?,
+                )?)
+            }
+            (ApiKey::LeaveGroup, Some((client, _))) => {
+                let req = LeaveGroupRequest::decode(&mut frame, version)?;
+                let body = groups::leave_group(client, &req, version)?;
+                Some(response(id, key, version, &body)?)
+            }
+            (ApiKey::OffsetCommit, Some((client, _))) => {
+                let req = OffsetCommitRequest::decode(&mut frame, version)?;
+                Some(response(
+                    id,
+                    key,
+                    version,
+                    &groups::offset_commit(client, &req)?,
+                )?)
+            }
+            (ApiKey::OffsetFetch, Some((client, _))) => {
+                let req = OffsetFetchRequest::decode(&mut frame, version)?;
+                let body = groups::offset_fetch(client, &req, version)?;
+                Some(response(id, key, version, &body)?)
             }
             (_, Some(_)) => bail!("{key:?} came after authentication"),
         };

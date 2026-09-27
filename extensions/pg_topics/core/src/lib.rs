@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod groups;
 pub mod handlers;
 pub mod listener;
 pub mod murmur2;

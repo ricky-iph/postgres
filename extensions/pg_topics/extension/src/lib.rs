@@ -1095,7 +1095,7 @@ mod tests {
         );
         assert_eq!(
             commit("public.nothing_q", "pgt_fence", 0, 1, 6),
-            Some("UNKNOWN_TOPIC_OR_PARTITION".into())
+            Some("TOPIC_AUTHORIZATION_FAILED".into())
         );
         Spi::run("CREATE ROLE pgt_fence_other").unwrap();
         Spi::run("SET LOCAL ROLE pgt_fence_other").unwrap();
@@ -1210,7 +1210,96 @@ mod tests {
     }
 
     #[pg_test]
+    fn offset_functions_answer_a_missing_topic_like_an_unreadable_one() {
+        Spi::run(
+            "SELECT topic.create_topic('public.hidden_q', 1);
+             CREATE ROLE pgt_blind;
+             INSERT INTO topic.topic_groups (group_name, owner_role, generation_id, state)
+             VALUES ('pgt_blind', 'pgt_blind', 1, 'Stable');",
+        )
+        .unwrap();
+        Spi::run("SET LOCAL ROLE pgt_blind").unwrap();
+        let answer = |topic: &str| {
+            (
+                commit(topic, "pgt_blind", 0, 1, 1),
+                commit(topic, "pgt_blind", 0, 1, -1),
+                state_of(&format!(
+                    "SELECT topic.fetch_offset('{topic}', 'pgt_blind', 0)"
+                )),
+                error_of(&format!(
+                    "SELECT topic.fetch_offset('{topic}', 'pgt_blind', 0)"
+                ))
+                .map(|e| e.replace(topic, "<topic>")),
+            )
+        };
+        let (hidden, missing) = (answer("public.hidden_q"), answer("public.ghost_q"));
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(hidden, missing);
+        assert_eq!(hidden.0, Some("TOPIC_AUTHORIZATION_FAILED".into()));
+        assert_eq!(hidden.2, Some("42501".into()));
+    }
+
+    #[pg_test]
+    fn an_admin_commit_creates_a_missing_group() {
+        Spi::run(
+            "SELECT topic.create_topic('public.assign_q', 1);
+             SELECT topic.publish('public.assign_q', '{}') FROM generate_series(1, 5);
+             SELECT topic.stamp_topic('public', 'assign_q');
+             CREATE ROLE pgt_assign; GRANT SELECT ON public.assign_q TO pgt_assign;",
+        )
+        .unwrap();
+        Spi::run("SET LOCAL ROLE pgt_assign").unwrap();
+        let committed = (
+            commit("public.assign_q", "pgt_assigned", 0, 3, 5),
+            commit("public.assign_q", "pgt_assigned", 0, 3, -1),
+            commit("public.ghost_q", "pgt_ghost", 0, 3, -1),
+            commit("public.assign_q", "", 0, 3, -1),
+            commit(
+                "public.assign_q",
+                "__pg_topics_sync:public.assign_q",
+                0,
+                3,
+                -1,
+            ),
+            one::<i64>("SELECT topic.fetch_offset('public.assign_q', 'pgt_assigned', 0)"),
+        );
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(
+            committed,
+            (
+                Some("UNKNOWN_MEMBER_ID".into()),
+                Some("NONE".into()),
+                Some("UNKNOWN_MEMBER_ID".into()),
+                Some("INVALID_GROUP_ID".into()),
+                Some("INVALID_GROUP_ID".into()),
+                Some(3)
+            )
+        );
+        assert_eq!(
+            one::<String>(
+                "SELECT string_agg(group_name || '/' || owner_role || '/' || state, ',' ORDER BY group_name)
+                 FROM topic.topic_groups WHERE owner_role = 'pgt_assign'"
+            ),
+            Some("pgt_assigned/pgt_assign/Empty".into())
+        );
+    }
+
+    #[pg_test]
+    fn wire_bytes_reads_only_a_base64_string() {
+        assert_eq!(
+            one::<String>(
+                r#"SELECT string_agg(coalesce(encode(topic.wire_bytes(v), 'hex'), 'NULL'), ',' ORDER BY n)
+                   FROM unnest('{"\"AAEC\"", "\"AAE=\"", "\"\"", "\"m\"", "\"AA\"", "[0]", "null"}'::jsonb[])
+                        WITH ORDINALITY u(v, n)"#
+            ),
+            Some("000102,0001,,NULL,NULL,NULL,NULL".into())
+        );
+        assert_eq!(one::<Vec<u8>>("SELECT topic.wire_bytes(NULL)"), None);
+    }
+
+    #[pg_test]
     fn fetch_offset_only_reads() {
+        Spi::run("SELECT topic.create_topic('public.none_q', 1)").unwrap();
         let [a, b] = [member("pgt_read"), member("pgt_read")];
         assert_eq!(join("pgt_read", &a, 6000), Some("WAIT".into()));
         assert_eq!(join("pgt_read", &b, 6000), Some("WAIT".into()));

@@ -175,6 +175,34 @@ def traffic(topic, seconds):
           "consumed", len(delivered & seen), flush=True)
 
 
+def member(topic, group, name, cfg=""):
+    c = consumer(**{"group.id": group, "session.timeout.ms": 6000, "heartbeat.interval.ms": 1000,
+                    "auto.offset.reset": "earliest",
+                    **dict(item.split("=", 1) for item in cfg.split(",") if item)})
+    c.subscribe([topic])
+    last, read = None, 0
+    while not os.path.exists(f"/w/stop-{name}"):
+        m = c.poll(0.2)
+        if m is not None and not m.error():
+            read += 1
+        now = ",".join(str(p.partition) for p in sorted(c.assignment(), key=lambda p: p.partition))
+        if now != last:
+            print("assigned", now or "-", flush=True)
+            last = now
+    c.close()
+    print("closed read", read, flush=True)
+
+
+def group_offsets(group):
+    from confluent_kafka import ConsumerGroupTopicPartitions
+    from confluent_kafka.admin import AdminClient
+    admin = AdminClient(base())
+    for future in admin.list_consumer_group_offsets([ConsumerGroupTopicPartitions(group)]).values():
+        for tp in sorted(future.result(timeout=20).topic_partitions, key=lambda p: (p.topic, p.partition)):
+            print("offset", tp.topic, tp.partition, tp.offset, tp.error.name() if tp.error else "NONE", flush=True)
+
+
 if __name__ == "__main__":
     {"produce": produce, "consume": consume, "offsets": offsets, "latency": latency, "metadata": metadata,
-     "traffic": traffic, "raw": raw}[sys.argv[1]](*sys.argv[2:])
+     "traffic": traffic, "raw": raw, "member": member,
+     "group_offsets": group_offsets}[sys.argv[1]](*sys.argv[2:])

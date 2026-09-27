@@ -140,7 +140,7 @@ start_listener() {
 kafka_py() {
   local user=$1 password=$2
   shift 2
-  docker run --rm --network host -v "$WORK:/w:ro" -v "$HERE/clients/python:/app:ro" \
+  docker run --rm ${KAFKA_NAME:+--name "$KAFKA_NAME"} --network host -v "$WORK:/w:ro" -v "$HERE/clients/python:/app:ro" \
     -e BOOTSTRAP="127.0.0.1:$KPORT" -e KAFKA_USER="$user" -e KAFKA_PASSWORD="$password" \
     pg_topics_python:2.15.1 python /app/client.py "$@" 2>&1
 }

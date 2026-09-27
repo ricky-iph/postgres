@@ -672,6 +672,14 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION topic.wire_bytes(value jsonb) RETURNS bytea
+LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT CASE WHEN jsonb_typeof(value) = 'string'
+                 AND value #>> '{}' ~ '^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$'
+           THEN decode(value #>> '{}', 'base64') END
+$$;
+
 CREATE FUNCTION topic.group_rebalance(group_name text) RETURNS void
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
 AS $$
@@ -1019,15 +1027,22 @@ DECLARE
     k int;
     current_generation int;
     stored bigint;
+    readable boolean := queue IS NOT NULL
+        AND EXISTS (SELECT FROM topic.topic_config c WHERE c.schema_name = s AND c.topic = t)
+        AND has_table_privilege(topic.caller(), queue, 'SELECT');
 BEGIN
-    IF starts_with(commit_offset.group_name, '__pg_topics_sync:') THEN
+    IF commit_offset.group_name = '' OR starts_with(commit_offset.group_name, '__pg_topics_sync:') THEN
         RETURN 'INVALID_GROUP_ID';
+    END IF;
+    IF commit_offset.generation = -1 AND readable THEN
+        INSERT INTO topic.topic_groups (group_name, owner_role) VALUES (commit_offset.group_name, topic.caller())
+        ON CONFLICT DO NOTHING;
     END IF;
     err := topic.group_enter(commit_offset.group_name);
     IF err IS NOT NULL THEN
         RETURN err;
     END IF;
-    IF queue IS NOT NULL AND NOT has_table_privilege(topic.caller(), queue, 'SELECT') THEN
+    IF NOT readable THEN
         RETURN 'TOPIC_AUTHORIZATION_FAILED';
     END IF;
     IF new_offset IS NULL OR new_offset < 0 THEN
@@ -1074,7 +1089,9 @@ DECLARE
 BEGIN
     SELECT g.owner_role INTO group_owner FROM topic.topic_groups g WHERE g.group_name = fetch_offset.group_name;
     IF NOT pg_has_role(topic.caller(), group_owner, 'member')
-       OR (queue IS NOT NULL AND NOT has_table_privilege(topic.caller(), queue, 'SELECT')) THEN
+       OR queue IS NULL
+       OR NOT EXISTS (SELECT FROM topic.topic_config c WHERE c.schema_name = s AND c.topic = t)
+       OR NOT has_table_privilege(topic.caller(), queue, 'SELECT') THEN
         RAISE EXCEPTION 'topic.fetch_offset: role % may not read group % on topic %',
             topic.caller(), fetch_offset.group_name, fetch_offset.topic USING ERRCODE = '42501';
     END IF;

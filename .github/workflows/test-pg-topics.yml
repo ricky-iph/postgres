@@ -192,6 +192,7 @@ jobs:
           bash bench/run_sql_consumer.sh
           bash bench/run_kafka_basic.sh
           bash bench/run_listener_restart.sh
+          bash bench/run_kafka_groups.sh
 
       - name: pg_topics untouched
         if: needs.changes.outputs.pgt != 'true'

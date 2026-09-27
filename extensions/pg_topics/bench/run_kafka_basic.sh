@@ -24,7 +24,7 @@ start_listener
 chk "the listener binds the port that ALTER DATABASE postgres SET pg_topics.port gives" \
   "listening on port $KPORT" "$(listener_status)"
 chk "an ApiVersions version that is not known gets the v0 response with UNSUPPORTED_VERSION" 1 \
-  "$(kafka_py alice alice-pw raw 0000000b0012006300000007000000 | grep -c '^raw 00000034000000070023' || true)"
+  "$(kafka_py alice alice-pw raw 0000000b0012006300000007000000 | grep -c '^raw 0000005e000000070023' || true)"
 chk "a Metadata request before authentication closes the connection with no response" "raw closed" \
   "$(kafka_py alice alice-pw raw 0000000e00030000000000010000000000000000 | grep '^raw' || true)"
 chk "before authentication, a frame above 64 KiB closes the connection at once" "raw closed" \
