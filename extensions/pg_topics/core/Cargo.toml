@@ -10,3 +10,4 @@ name = "pgt"
 path = "src/lib.rs"
 
 [dependencies]
+postgres = "0.19"

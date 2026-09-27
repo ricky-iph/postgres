@@ -70,22 +70,37 @@ fn read_one<T: FromDatum + IntoDatum>(
     Spi::connect(|client| client.select(sql, Some(1), Some(args))?.first().get_one())
 }
 
-#[pg_extern]
-#[search_path(pg_catalog, pg_temp)]
-fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -> spi::Result<i32> {
-    let names = || vec![text_arg(schema_name), text_arg(topic)];
+fn queue_owner(caller: &str, schema_name: &str, topic: &str) -> spi::Result<pg_sys::Oid> {
     read_one::<String>(
         "SELECT pg_catalog.set_config('row_security', 'off', true)",
         vec![],
     )?;
-    let owner = read_one::<pg_sys::Oid>(
-        "SELECT (SELECT c.relowner FROM topic.topic_config t
-                 JOIN pg_catalog.pg_namespace n ON n.nspname = t.schema_name
-                 JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.topic
-                 WHERE t.schema_name = $1 AND t.topic = $2)",
-        names(),
-    )?
-    .unwrap_or_else(|| error!("topic.stamp_topic: topic {schema_name}.{topic} does not exist"));
+    let (owner, kind) = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT r.relowner, r.relkind::text FROM (VALUES (1)) v
+                 LEFT JOIN LATERAL (SELECT c.relowner, c.relkind FROM topic.topic_config t
+                     JOIN pg_catalog.pg_namespace n ON n.nspname = t.schema_name
+                     JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.topic
+                     WHERE t.schema_name = $1 AND t.topic = $2) r ON true",
+                Some(1),
+                Some(vec![text_arg(schema_name), text_arg(topic)]),
+            )?
+            .first()
+            .get_two::<pg_sys::Oid, String>()
+    })?;
+    match (owner, kind.as_deref()) {
+        (Some(owner), Some("p")) => Ok(owner),
+        (Some(_), _) => error!("{caller}: {schema_name}.{topic} is not a partitioned table"),
+        _ => error!("{caller}: topic {schema_name}.{topic} does not exist"),
+    }
+}
+
+#[pg_extern]
+#[search_path(pg_catalog, pg_temp)]
+fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -> spi::Result<i32> {
+    let names = || vec![text_arg(schema_name), text_arg(topic)];
+    let owner = queue_owner("topic.stamp_topic", schema_name, topic)?;
     let queue = quote_qualified_identifier(schema_name, topic);
     let beat = |backlog: Option<Interval>| {
         let mut args = names();
@@ -199,6 +214,133 @@ fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -
         )?;
     }
     Ok(total as i32)
+}
+
+#[pg_extern]
+#[search_path(pg_catalog, pg_temp)]
+fn retention_check(detached: pg_sys::Oid) -> spi::Result<i64> {
+    let (schema_name, topic) = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT schema_name, topic FROM topic.topic_config WHERE detaching = $1",
+                Some(1),
+                Some(vec![(PgBuiltInOids::OIDOID.oid(), detached.into_datum())]),
+            )?
+            .first()
+            .get_two::<String, String>()
+    })?;
+    let (Some(schema_name), Some(topic)) = (schema_name, topic) else {
+        error!(
+            "topic.retention_check: {} is not a table that retention detaches",
+            detached.as_u32()
+        );
+    };
+    let owner = queue_owner("topic.retention_check", &schema_name, &topic)?;
+    let table = read_one::<String>(
+        "SELECT $1::pg_catalog.regclass::text",
+        vec![(PgBuiltInOids::OIDOID.oid(), detached.into_datum())],
+    )?
+    .unwrap_or_default();
+    as_owner(owner, || {
+        read_one::<i64>(
+            &format!("SELECT count(*) FROM {table} WHERE log_offset IS NULL"),
+            vec![],
+        )
+    })
+    .map(Option::unwrap_or_default)
+}
+
+#[pg_extern]
+#[search_path(pg_catalog, pg_temp)]
+fn retention_floor(
+    schema_name: &str,
+    topic: &str,
+) -> spi::Result<TableIterator<'static, (name!(band, i16), name!(floor, i64))>> {
+    let owner = queue_owner("topic.retention_floor", schema_name, topic)?;
+    let (bands, next) = Spi::get_two_with_args::<Vec<i16>, Vec<i64>>(
+        "SELECT array_agg(band ORDER BY band), array_agg(next_offset ORDER BY band)
+         FROM (SELECT band, next_offset FROM topic.topic_band_position
+               WHERE schema_name = $1 AND topic = $2 FOR UPDATE) b",
+        vec![text_arg(schema_name), text_arg(topic)],
+    )?;
+    let (bands, next) = (bands.unwrap_or_default(), next.unwrap_or_default());
+    let queue = quote_qualified_identifier(schema_name, topic);
+    let lowest = as_owner(owner, || {
+        read_one::<Vec<Option<i64>>>(
+            &format!(
+                "SELECT array_agg((SELECT min(q.log_offset) FROM {queue} q
+                                   WHERE q.band = b AND q.log_offset IS NOT NULL) ORDER BY b)
+                 FROM unnest($1::smallint[]) b"
+            ),
+            vec![(
+                PgBuiltInOids::INT2ARRAYOID.oid(),
+                bands.clone().into_datum(),
+            )],
+        )
+    })?
+    .unwrap_or_default();
+    Ok(TableIterator::new(
+        bands
+            .into_iter()
+            .zip(next)
+            .zip(lowest)
+            .map(|((band, next), low)| (band, low.unwrap_or(next))),
+    ))
+}
+
+#[pg_extern]
+#[search_path(pg_catalog, pg_temp)]
+fn check_duplicates(
+    schema_name: &str,
+    topic: &str,
+    full: default!(bool, false),
+) -> spi::Result<
+    TableIterator<'static, (name!(band, i16), name!(log_offset, i64), name!(copies, i64))>,
+> {
+    let owner = queue_owner("topic.check_duplicates", schema_name, topic)?;
+    let interval = read_one::<Interval>(
+        "SELECT partition_interval FROM topic.topic_config WHERE schema_name = $1 AND topic = $2",
+        vec![text_arg(schema_name), text_arg(topic)],
+    )?;
+    let queue = quote_qualified_identifier(schema_name, topic);
+    let sql = if full {
+        format!(
+            "SELECT q.band, q.log_offset, count(*) FROM {queue} q WHERE q.log_offset IS NOT NULL
+             GROUP BY q.band, q.log_offset HAVING count(*) > 1 ORDER BY 1, 2"
+        )
+    } else {
+        format!(
+            "SELECT DISTINCT d.band, d.log_offset, d.copies FROM (
+                 SELECT r.band, r.log_offset,
+                        (SELECT count(*) FROM {queue} q WHERE q.band = r.band AND q.log_offset = r.log_offset) AS copies
+                 FROM {queue} r
+                 WHERE r.log_offset IS NOT NULL
+                   AND r.published_at >= pg_catalog.date_bin($1, pg_catalog.now(), timestamptz '2000-01-01 00:00:00+00')) d
+             WHERE d.copies > 1 ORDER BY 1, 2"
+        )
+    };
+    let rows = as_owner(owner, || {
+        Spi::connect(|client| {
+            client
+                .select(
+                    &sql,
+                    None,
+                    Some(vec![(
+                        PgBuiltInOids::INTERVALOID.oid(),
+                        interval.into_datum(),
+                    )]),
+                )?
+                .map(|row| {
+                    Ok((
+                        row.get::<i16>(1)?.unwrap_or_default(),
+                        row.get::<i64>(2)?.unwrap_or_default(),
+                        row.get::<i64>(3)?.unwrap_or_default(),
+                    ))
+                })
+                .collect::<spi::Result<Vec<_>>>()
+        })
+    })?;
+    Ok(TableIterator::new(rows))
 }
 
 fn database_names(list: &str) -> Vec<&str> {
@@ -334,6 +476,53 @@ pub extern "C" fn pg_topics_stamper_main(_arg: pg_sys::Datum) {
     unsafe { pg_sys::proc_exit(1) }
 }
 
+#[no_mangle]
+#[pg_guard]
+pub extern "C" fn pg_topics_partition_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM);
+    let database = BackgroundWorker::get_extra();
+    BackgroundWorker::connect_worker_to_spi(Some(database), None);
+    let user = in_transaction(|| {
+        read_one::<String>(
+            "SELECT rolname::text FROM pg_catalog.pg_authid WHERE oid = 10",
+            vec![],
+        )
+    })
+    .unwrap_or_default();
+    let sockets = unsafe { CStr::from_ptr(pg_sys::Unix_socket_directories) }.to_string_lossy();
+    let socket = sockets.split(',').next().unwrap_or_default().trim();
+    let port = unsafe { pg_sys::PostPortNumber } as u16;
+    let mut client = match pgt::partitions::connect(socket, port, &user, database) {
+        Ok(client) => client,
+        Err(e) => {
+            warning!(
+                "pg_topics partition worker: cannot connect to {database} over the socket in {socket:?}: {}. The worker tries again in 5 s.",
+                pgt::partitions::message(&e)
+            );
+            unsafe { pg_sys::proc_exit(1) }
+        }
+    };
+    let mut ticks: u64 = 0;
+    loop {
+        let result = pgt::partitions::tick(&mut client, ticks.is_multiple_of(360), &mut |m| {
+            warning!("pg_topics partition worker: {m}")
+        });
+        if let Err(e) = result {
+            warning!(
+                "pg_topics partition worker: {}. The worker tries again in 5 s.",
+                pgt::partitions::message(&e)
+            );
+            break;
+        }
+        ticks += 1;
+        unsafe { pg_sys::pgstat_report_stat(false) };
+        if !wait_latch(10_000) {
+            break;
+        }
+    }
+    unsafe { pg_sys::proc_exit(1) }
+}
+
 #[pg_guard]
 pub extern "C" fn _PG_init() {
     if unsafe { !pg_sys::process_shared_preload_libraries_in_progress } {
@@ -364,6 +553,14 @@ pub extern "C" fn _PG_init() {
             .set_type("pg_topics stamper")
             .set_library("pg_topics")
             .set_function("pg_topics_stamper_main")
+            .set_extra(database)
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .enable_spi_access()
+            .load();
+        BackgroundWorkerBuilder::new(&format!("pg_topics partition {database}"))
+            .set_type("pg_topics partition")
+            .set_library("pg_topics")
+            .set_function("pg_topics_partition_main")
             .set_extra(database)
             .set_restart_time(Some(Duration::from_secs(5)))
             .enable_spi_access()
@@ -777,6 +974,177 @@ mod tests {
                  AND NOT coalesce('search_path=pg_catalog, pg_temp' = ANY (proconfig), false)"
             ),
             Some(vec![])
+        );
+    }
+
+    #[pg_test]
+    fn ensure_partitions_adds_owned_indexed_partitions() {
+        tenant("pgt_parts");
+        Spi::run("SET LOCAL ROLE pgt_parts").unwrap();
+        Spi::run("SELECT topic.create_topic('pgt_parts.p_q', 1, partition_interval => '1 hour')")
+            .unwrap();
+        Spi::run("RESET ROLE").unwrap();
+        Spi::run("SELECT topic.ensure_partitions('pgt_parts', 'p_q', 3)").unwrap();
+        Spi::run("SELECT topic.ensure_partitions('pgt_parts', 'p_q', 3)").unwrap();
+        Spi::run("SET LOCAL TimeZone = 'UTC'").unwrap();
+        let parts = "FROM pg_inherits h JOIN pg_class c ON c.oid = h.inhrelid,
+                     LATERAL (SELECT to_timestamp(right(c.relname, 14), 'YYYYMMDDHH24MISS') AS lo) b
+                     WHERE h.inhparent = 'pgt_parts.p_q'::regclass";
+        assert_eq!(
+            one::<Vec<i32>>(&format!(
+                "SELECT array_agg((extract(epoch FROM b.lo - date_bin('1 hour', now(), '2000-01-01')) / 3600)::int
+                                  ORDER BY b.lo) {parts}"
+            )),
+            Some(vec![0, 1, 2, 3])
+        );
+        assert_eq!(
+            one::<Vec<String>>(&format!(
+                "SELECT array_agg(format('%s %s %s',
+                    pg_get_expr(c.relpartbound, c.oid) = format('FOR VALUES FROM (%L) TO (%L)',
+                        to_char(b.lo, 'YYYY-MM-DD HH24:MI:SS+00'),
+                        to_char(b.lo + interval '1 hour', 'YYYY-MM-DD HH24:MI:SS+00')),
+                    pg_get_userbyid(c.relowner),
+                    EXISTS (SELECT FROM pg_index x WHERE x.indrelid = c.oid AND x.indisunique)))
+                 {parts}"
+            )),
+            Some(vec!["t pgt_parts t".to_string(); 4])
+        );
+    }
+
+    #[pg_test]
+    fn ensure_partitions_skips_a_table_that_has_a_partition_name() {
+        Spi::run("SELECT topic.create_topic('public.clash_q', 1, partition_interval => '1 hour')")
+            .unwrap();
+        Spi::run(
+            "SET LOCAL TimeZone = 'UTC';
+             CREATE TABLE public.foreign_t ();
+             DO $$ BEGIN EXECUTE format('ALTER TABLE public.foreign_t RENAME TO %I',
+                 'clash_q_p' || to_char(date_bin('1 hour', now(), '2000-01-01') + interval '2 hours', 'YYYYMMDDHH24MISS'));
+             END $$",
+        )
+        .unwrap();
+        Spi::run("SELECT topic.ensure_partitions('public', 'clash_q', 3)").unwrap();
+        assert_eq!(
+            one::<Vec<i32>>(
+                "SELECT array_agg((extract(epoch FROM to_timestamp(right(c.relname, 14), 'YYYYMMDDHH24MISS')
+                                   - date_bin('1 hour', now(), '2000-01-01')) / 3600)::int ORDER BY c.relname)
+                 FROM pg_inherits h JOIN pg_class c ON c.oid = h.inhrelid
+                 WHERE h.inhparent = 'public.clash_q'::regclass"
+            ),
+            Some(vec![0, 1, 3])
+        );
+    }
+
+    #[pg_test]
+    fn queue_functions_refuse_a_view_in_place_of_the_queue() {
+        tenant("pgt_view");
+        Spi::run("SET LOCAL ROLE pgt_view").unwrap();
+        Spi::run(
+            "SELECT topic.create_topic('pgt_view.v_q', 1, partition_interval => '1 hour');
+             DROP TABLE pgt_view.v_q;
+             CREATE VIEW pgt_view.v_q AS
+                 SELECT 0::smallint AS band, 0::bigint AS log_offset, now() AS published_at, 0::bigint AS seq",
+        )
+        .unwrap();
+        Spi::run("RESET ROLE").unwrap();
+        for call in [
+            "SELECT topic.stamp_topic('pgt_view', 'v_q')",
+            "SELECT count(*) FROM topic.check_duplicates('pgt_view', 'v_q', full => true)",
+            "SELECT count(*) FROM topic.retention_floor('pgt_view', 'v_q')",
+            "SELECT topic.ensure_partitions('pgt_view', 'v_q', 3)",
+        ] {
+            let refused = error_of(call);
+            assert!(
+                refused
+                    .as_deref()
+                    .is_some_and(|e| e.contains("is not a partitioned table")),
+                "{call}: {refused:?}"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn check_duplicates_finds_cross_partition_copy() {
+        Spi::run("SELECT topic.create_topic('public.dup_q', 1, partition_interval => '1 hour')")
+            .unwrap();
+        Spi::run("SELECT topic.publish('public.dup_q', '{}') FROM generate_series(1, 3)").unwrap();
+        assert_eq!(
+            one::<i32>("SELECT topic.stamp_topic('public', 'dup_q')"),
+            Some(3)
+        );
+        let found = |full: bool| {
+            one::<Vec<String>>(&format!(
+                "SELECT coalesce(array_agg(band || ':' || log_offset || ':' || copies), '{{}}')
+                 FROM topic.check_duplicates('public', 'dup_q', full => {full})"
+            ))
+        };
+        assert_eq!(found(true), Some(vec![]));
+        assert_eq!(found(false), Some(vec![]));
+        Spi::run(
+            "INSERT INTO public.dup_q (band, value, published_at)
+             VALUES (0, '{}', date_bin('1 hour', now(), '2000-01-01') + interval '1 hour');
+             UPDATE public.dup_q SET log_offset = 1 WHERE log_offset IS NULL",
+        )
+        .unwrap();
+        assert_eq!(
+            one::<i64>("SELECT count(DISTINCT tableoid) FROM public.dup_q WHERE log_offset = 1"),
+            Some(2)
+        );
+        assert_eq!(found(true), Some(vec!["0:1:2".to_string()]));
+        assert_eq!(found(false), Some(vec!["0:1:2".to_string()]));
+    }
+
+    #[pg_test]
+    fn reap_removes_old_producers_and_expired_groups() {
+        Spi::run(
+            "SELECT topic.create_topic('public.kept_q', 1, partition_interval => '1 hour');
+             SELECT topic.create_topic('public.reaped_q', 1, partition_interval => '1 hour');
+             UPDATE topic.topic_config SET offset_retention = '1 hour' WHERE topic = 'reaped_q';
+             INSERT INTO topic.topic_producers
+                 (schema_name, topic, producer_id, producer_epoch, band, slot, first_sequence, last_sequence, base_offset, updated_at)
+             VALUES ('public', 'kept_q', 1, 0, 0, 0, 0, 0, -1, now() - interval '25 hours'),
+                    ('public', 'kept_q', 2, 0, 0, 0, 0, 0, -1, now() - interval '23 hours');
+             INSERT INTO topic.topic_groups (group_name, owner_role, state, updated_at)
+             VALUES ('old_empty', 'postgres', 'Empty', now() - interval '2 hours'),
+                    ('new_empty', 'postgres', 'Empty', now() - interval '30 minutes'),
+                    ('old_stable', 'postgres', 'Stable', now() - interval '2 hours'),
+                    ('old_member', 'postgres', 'Empty', now() - interval '2 hours'),
+                    ('old_forever', 'postgres', 'Empty', now() - interval '2 hours'),
+                    ('old_no_offsets', 'postgres', 'Empty', now() - interval '2 hours'),
+                    ('__pg_topics_sync:public.reaped_q', 'postgres', 'Empty', now() - interval '2 hours');
+             INSERT INTO topic.topic_group_members (group_name, member_id, owner_role, session_timeout_ms, rebalance_ms)
+             VALUES ('old_member', 'm', 'postgres', 6000, 6000);
+             INSERT INTO topic.topic_offsets (schema_name, topic, group_name, band, owner_role)
+             SELECT 'public', 'reaped_q', g, 0, 'postgres'
+             FROM unnest(ARRAY['old_empty', 'new_empty', 'old_stable', 'old_member', 'old_forever',
+                               '__pg_topics_sync:public.reaped_q']) g;
+             INSERT INTO topic.topic_offsets (schema_name, topic, group_name, band, owner_role)
+             VALUES ('public', 'kept_q', 'old_forever', 0, 'postgres');
+             SELECT topic.reap();",
+        )
+        .unwrap();
+        assert_eq!(
+            one::<Vec<i64>>(
+                "SELECT array_agg(producer_id ORDER BY producer_id) FROM topic.topic_producers"
+            ),
+            Some(vec![2])
+        );
+        assert_eq!(
+            one::<Vec<String>>(
+                "SELECT array_agg(group_name ORDER BY group_name COLLATE \"C\") FROM topic.topic_groups"
+            ),
+            Some(
+                [
+                    "__pg_topics_sync:public.reaped_q",
+                    "new_empty",
+                    "old_forever",
+                    "old_member",
+                    "old_no_offsets",
+                    "old_stable"
+                ]
+                .map(String::from)
+                .to_vec()
+            )
         );
     }
 

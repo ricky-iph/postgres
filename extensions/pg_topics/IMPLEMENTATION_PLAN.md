@@ -862,3 +862,5 @@ Open questions for the requester: none.
 
 - `DETACH … CONCURRENTLY` needs a local superuser connection over the Unix socket. If `pg_hba.conf` forbids it, retention stops and `health()` shows headroom and backlog. Stamping continues.
 - A delete by tombstone leaves no marker, so an older update that arrives later on another band inserts the row again.
+- A pending detach completes only with `DETACH … FINALIZE`, and FINALIZE waits for every older snapshot in the database. A long query anywhere in the database stops retention on that topic until the query ends.
+- The oldest expired partition that holds an unstamped row is attached again, and retention holds that topic for one `retention_interval` (`topic_config.retention_hold_until`). Newer expired partitions wait behind it. A late row therefore stays readable for at least one retention interval after it gets its offset.

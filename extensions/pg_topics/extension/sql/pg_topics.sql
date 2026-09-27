@@ -10,6 +10,9 @@ CREATE TABLE topic.topic_config (
     partition_interval interval NOT NULL DEFAULT '1 day'
         CHECK (partition_interval >= interval '1 minute'),
     detaching          regclass,
+    detaching_name     text,
+    detaching_bound    text,
+    retention_hold_until timestamptz,
     sync_table         regclass,
     sync_key           text,
     sync_enabled       boolean  NOT NULL DEFAULT false,
@@ -44,7 +47,8 @@ CREATE TABLE topic.topic_groups (
     protocol_name    text,
     state            text    NOT NULL DEFAULT 'Empty'
         CHECK (state IN ('Empty', 'PreparingRebalance', 'CompletingRebalance', 'Stable', 'Dead')),
-    expired_members  bigint  NOT NULL DEFAULT 0
+    expired_members  bigint  NOT NULL DEFAULT 0,
+    updated_at       timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE topic.topic_group_members (
@@ -146,6 +150,45 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION topic.ensure_partitions(schema_name text, topic text, ahead int) RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp SET DateStyle = ISO SET TimeZone = UTC
+AS $$
+DECLARE
+    c topic.topic_config;
+    parent regclass;
+    owner_name name;
+    lo timestamptz;
+    p text;
+    existing regclass;
+BEGIN
+    SELECT * INTO STRICT c FROM topic.topic_config t
+    WHERE t.schema_name = ensure_partitions.schema_name AND t.topic = ensure_partitions.topic;
+    parent := format('%I.%I', c.schema_name, c.topic)::regclass;
+    SELECT r.rolname INTO owner_name FROM pg_class k JOIN pg_roles r ON r.oid = k.relowner
+    WHERE k.oid = parent AND k.relkind = 'p';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'topic.ensure_partitions: % is not a partitioned table', parent;
+    END IF;
+    FOR i IN 0..ahead LOOP
+        lo := date_bin(c.partition_interval, now(), timestamptz '2000-01-01 00:00:00+00') + i * c.partition_interval;
+        p := c.topic || '_p' || to_char(lo, 'YYYYMMDDHH24MISS');
+        existing := to_regclass(format('%I.%I', c.schema_name, p));
+        IF existing IS NOT NULL THEN
+            IF NOT EXISTS (SELECT FROM pg_inherits h WHERE h.inhrelid = existing AND h.inhparent = parent) THEN
+                RAISE WARNING 'topic: % exists and is not a partition of %, so % gets no partition from %',
+                    existing, parent, parent, lo;
+            END IF;
+            CONTINUE;
+        END IF;
+        EXECUTE format('CREATE TABLE %I.%I (LIKE %s INCLUDING DEFAULTS INCLUDING CONSTRAINTS)', c.schema_name, p, parent);
+        EXECUTE format('ALTER TABLE %I.%I OWNER TO %I', c.schema_name, p, owner_name);
+        EXECUTE format('CREATE UNIQUE INDEX ON %I.%I (band, log_offset) WHERE log_offset IS NOT NULL', c.schema_name, p);
+        EXECUTE format('ALTER TABLE %s ATTACH PARTITION %I.%I FOR VALUES FROM (%L) TO (%L)',
+            parent, c.schema_name, p, lo, lo + c.partition_interval);
+    END LOOP;
+END
+$$;
+
 CREATE FUNCTION topic.create_topic(
     topic text,
     band_count int DEFAULT 4,
@@ -159,8 +202,6 @@ DECLARE
     s text := split_part(create_topic.topic, '.', 1);
     t text := substr(create_topic.topic, length(s) + 2);
     owner_name text := topic.caller();
-    lo timestamptz := date_bin(partition_interval, now(), timestamptz '2000-01-01 00:00:00+00');
-    p text;
 BEGIN
     IF s !~ '^[A-Za-z0-9_-]{1,63}$' OR t !~ '^[A-Za-z0-9_-]{1,47}$' OR right(t, 2) <> '_q' THEN
         RAISE EXCEPTION 'topic.create_topic: % is not a valid topic name', create_topic.topic
@@ -204,14 +245,7 @@ BEGIN
         'CREATE TRIGGER topic_publish_floor BEFORE INSERT ON %I.%I FOR EACH STATEMENT
          EXECUTE FUNCTION topic.publish_floor()', s, t);
     EXECUTE format('ALTER TABLE %I.%I OWNER TO %I', s, t, owner_name);
-
-    FOR i IN 0..1 LOOP
-        p := t || '_p' || to_char((lo + i * partition_interval) AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISS');
-        EXECUTE format('CREATE TABLE %I.%I PARTITION OF %I.%I FOR VALUES FROM (%L) TO (%L)',
-            s, p, s, t, lo + i * partition_interval, lo + (i + 1) * partition_interval);
-        EXECUTE format('CREATE UNIQUE INDEX ON %I.%I (band, log_offset) WHERE log_offset IS NOT NULL', s, p);
-        EXECUTE format('ALTER TABLE %I.%I OWNER TO %I', s, p, owner_name);
-    END LOOP;
+    PERFORM topic.ensure_partitions(s, t, 1);
 END
 $$;
 
@@ -241,6 +275,91 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION topic.retention_next(schema_name text, topic text) RETURNS text
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp SET DateStyle = ISO SET TimeZone = UTC
+AS $$
+DECLARE
+    c topic.topic_config;
+    parent regclass;
+    pending boolean;
+BEGIN
+    SELECT * INTO STRICT c FROM topic.topic_config t
+    WHERE t.schema_name = retention_next.schema_name AND t.topic = retention_next.topic;
+    IF clock_timestamp() < c.retention_hold_until THEN
+        RETURN NULL;
+    END IF;
+    parent := format('%I.%I', c.schema_name, c.topic)::regclass;
+    IF c.detaching IS NOT NULL AND NOT EXISTS (SELECT FROM pg_class k WHERE k.oid = c.detaching) THEN
+        c.detaching := NULL;
+        UPDATE topic.topic_config t SET detaching = NULL
+        WHERE t.schema_name = c.schema_name AND t.topic = c.topic;
+    END IF;
+    IF c.detaching IS NULL THEN
+        SELECT h.inhrelid, pg_get_expr(k.relpartbound, k.oid) INTO c.detaching, c.detaching_bound
+        FROM pg_inherits h JOIN pg_class k ON k.oid = h.inhrelid
+        CROSS JOIN LATERAL substring(pg_get_expr(k.relpartbound, k.oid) FROM ' TO \(''([^'']+)''\)$') b(upper)
+        WHERE h.inhparent = parent AND NOT h.inhdetachpending
+          AND b.upper::timestamptz < now() - c.retention_interval
+        ORDER BY b.upper::timestamptz LIMIT 1;
+        IF c.detaching IS NULL THEN
+            RETURN NULL;
+        END IF;
+        UPDATE topic.topic_config t
+        SET detaching = c.detaching, detaching_name = c.detaching::text, detaching_bound = c.detaching_bound
+        WHERE t.schema_name = c.schema_name AND t.topic = c.topic;
+        c.detaching_name := c.detaching::text;
+    END IF;
+
+    SELECT h.inhdetachpending INTO pending FROM pg_inherits h WHERE h.inhrelid = c.detaching AND h.inhparent = parent;
+    IF FOUND THEN
+        RAISE LOG 'topic: retention detaches % from %', c.detaching, parent;
+        RETURN format('ALTER TABLE %s DETACH PARTITION %s %s', parent, c.detaching,
+                      CASE WHEN pending THEN 'FINALIZE' ELSE 'CONCURRENTLY' END);
+    END IF;
+    IF c.detaching::text IS DISTINCT FROM c.detaching_name
+       OR EXISTS (SELECT FROM pg_inherits h WHERE h.inhrelid = c.detaching) THEN
+        UPDATE topic.topic_config t SET detaching = NULL
+        WHERE t.schema_name = c.schema_name AND t.topic = c.topic;
+        RAISE WARNING 'topic: % was renamed or attached to another table after retention detached it from %, so retention leaves it',
+            c.detaching, parent;
+        RETURN NULL;
+    END IF;
+
+    EXECUTE format('LOCK TABLE %s IN ACCESS EXCLUSIVE MODE', c.detaching);
+    IF topic.retention_check(c.detaching) > 0 THEN
+        EXECUTE format('ALTER TABLE %s ATTACH PARTITION %s %s', parent, c.detaching, c.detaching_bound);
+        UPDATE topic.topic_config t SET detaching = NULL, retention_hold_until = clock_timestamp() + c.retention_interval
+        WHERE t.schema_name = c.schema_name AND t.topic = c.topic;
+        RAISE WARNING 'topic: % has rows with no log_offset, so retention attached it again to %', c.detaching, parent;
+        RETURN NULL;
+    END IF;
+    UPDATE topic.topic_band_position p SET oldest_offset = f.floor
+    FROM topic.retention_floor(c.schema_name, c.topic) f
+    WHERE p.schema_name = c.schema_name AND p.topic = c.topic AND p.band = f.band;
+    RAISE LOG 'topic: retention drops %', c.detaching;
+    EXECUTE format('DROP TABLE %s', c.detaching);
+    UPDATE topic.topic_config t SET detaching = NULL
+    WHERE t.schema_name = c.schema_name AND t.topic = c.topic;
+    RETURN NULL;
+END
+$$;
+
+CREATE FUNCTION topic.reap() RETURNS void
+LANGUAGE sql SET search_path = pg_catalog, pg_temp
+AS $$
+    DELETE FROM topic.topic_producers WHERE updated_at < now() - interval '1 day';
+    DELETE FROM topic.topic_groups g
+    WHERE g.state = 'Empty'
+      AND NOT starts_with(g.group_name, '__pg_topics_sync:')
+      AND NOT EXISTS (SELECT FROM topic.topic_group_members m WHERE m.group_name = g.group_name)
+      AND g.updated_at < now() - (
+          SELECT max(c.offset_retention)
+          FROM topic.topic_offsets o
+          JOIN topic.topic_config c ON c.schema_name = o.schema_name AND c.topic = o.topic
+          WHERE o.group_name = g.group_name
+          HAVING bool_and(c.offset_retention IS NOT NULL));
+$$;
+
 GRANT USAGE ON SCHEMA topic TO PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA topic FROM PUBLIC;
 SELECT pg_catalog.pg_extension_config_dump('topic.topic_config', '');
@@ -251,3 +370,9 @@ SELECT pg_catalog.pg_extension_config_dump('topic.topic_offsets', '');
 SELECT pg_catalog.pg_extension_config_dump('topic.topic_producers', '');
 GRANT SELECT ON topic.topic_groups, topic.topic_group_members, topic.topic_offsets TO PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.stamp_topic(text, text, int) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.retention_check(oid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.retention_floor(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.ensure_partitions(text, text, int) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.retention_next(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.reap() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.check_duplicates(text, text, boolean) FROM PUBLIC;
