@@ -181,8 +181,7 @@ jobs:
         env:
           PGRX_HOME: /home/runner/.cache/pg_topics/pgrx
           PG_CONFIG: /home/runner/.cache/pg_topics/pg17/usr/lib/postgresql/17/bin/pg_config
-        run: |
-          echo "no gate harnesses yet (Phase 0)"
+        run: bash bench/run_stamp_order.sh
 
       - name: pg_topics untouched
         if: needs.changes.outputs.pgt != 'true'
