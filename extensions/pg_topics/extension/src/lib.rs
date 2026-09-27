@@ -13,6 +13,8 @@ use pgrx::prelude::*;
 use pgrx::spi::{self, quote_qualified_identifier};
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 
+mod sync;
+
 pgrx::pg_module_magic!();
 
 extension_sql_file!("../sql/pg_topics.sql", finalize);
@@ -357,25 +359,29 @@ fn in_transaction<R>(f: impl FnOnce() -> spi::Result<R> + UnwindSafe) -> R {
     BackgroundWorker::transaction(AssertUnwindSafe(|| f().unwrap_or_else(|e| error!("{e}"))))
 }
 
-fn guarded<R>(f: impl FnOnce() -> R + UnwindSafe) -> Option<R> {
+fn error_text(e: CaughtError) -> String {
+    let (CaughtError::PostgresError(report)
+    | CaughtError::ErrorReport(report)
+    | CaughtError::RustPanic {
+        ereport: report, ..
+    }) = e;
+    report.message().to_string()
+}
+
+fn guarded<R>(worker: &str, f: impl FnOnce() -> R + UnwindSafe) -> Option<R> {
     PgTryBuilder::new(|| Some(f()))
         .catch_others(|e| {
             unsafe { pg_sys::AbortCurrentTransaction() };
-            let (CaughtError::PostgresError(report)
-            | CaughtError::ErrorReport(report)
-            | CaughtError::RustPanic {
-                ereport: report, ..
-            }) = e;
             warning!(
-                "pg_topics stamper: {}. The stamper tries again in 1 s.",
-                report.message()
+                "pg_topics {worker}: {}. The {worker} tries again in 1 s.",
+                error_text(e)
             );
             None
         })
         .execute()
 }
 
-fn topic_list() -> spi::Result<Option<Vec<(String, String)>>> {
+fn topic_list(filter: &str) -> spi::Result<Option<Vec<(String, String)>>> {
     if read_one::<bool>(
         "SELECT EXISTS (SELECT FROM pg_catalog.pg_extension WHERE extname = 'pg_topics')",
         vec![],
@@ -386,9 +392,11 @@ fn topic_list() -> spi::Result<Option<Vec<(String, String)>>> {
     let (schemas, topics) = Spi::connect(|client| {
         client
             .select(
-                "SELECT array_agg(schema_name ORDER BY schema_name, topic),
-                        array_agg(topic ORDER BY schema_name, topic)
-                 FROM topic.topic_config",
+                &format!(
+                    "SELECT array_agg(schema_name ORDER BY schema_name, topic),
+                            array_agg(topic ORDER BY schema_name, topic)
+                     FROM topic.topic_config WHERE {filter}"
+                ),
                 Some(1),
                 None,
             )?
@@ -436,16 +444,16 @@ fn wait_latch(ms: i64) -> bool {
     !BackgroundWorker::sigterm_received()
 }
 
-#[no_mangle]
-#[pg_guard]
-pub extern "C" fn pg_topics_stamper_main(_arg: pg_sys::Datum) {
+fn topic_worker(worker: &str, filter: &str, work: fn(&str, &str) -> spi::Result<i32>) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some(BackgroundWorker::get_extra()), None);
-    in_transaction(|| Spi::run("SET search_path = pg_catalog, pg_temp"));
+    in_transaction(|| {
+        Spi::run("SET search_path = pg_catalog, pg_temp; SET lock_timeout = '100ms'")
+    });
     let mut retry_after: HashMap<(String, String), Instant> = HashMap::new();
     let mut pause = 50;
     while wait_latch(pause) {
-        let Some(Some(topics)) = guarded(|| in_transaction(topic_list)) else {
+        let Some(Some(topics)) = guarded(worker, || in_transaction(|| topic_list(filter))) else {
             pause = 1000;
             continue;
         };
@@ -457,7 +465,7 @@ pub extern "C" fn pg_topics_stamper_main(_arg: pg_sys::Datum) {
             {
                 continue;
             }
-            match guarded(|| in_transaction(|| stamp_locked(&schema_name, &topic))) {
+            match guarded(worker, || in_transaction(|| work(&schema_name, &topic))) {
                 Some(n) => {
                     stamped |= n > 0;
                     retry_after.remove(&(schema_name, topic));
@@ -474,6 +482,24 @@ pub extern "C" fn pg_topics_stamper_main(_arg: pg_sys::Datum) {
         pause = if stamped { 1 } else { 50 };
     }
     unsafe { pg_sys::proc_exit(1) }
+}
+
+#[no_mangle]
+#[pg_guard]
+pub extern "C" fn pg_topics_stamper_main(_arg: pg_sys::Datum) {
+    topic_worker("stamper", "true", stamp_locked)
+}
+
+#[no_mangle]
+#[pg_guard]
+pub extern "C" fn pg_topics_sync_main(_arg: pg_sys::Datum) {
+    topic_worker("sync worker", "sync_enabled", |schema_name, topic| {
+        Ok(read_one::<i32>(
+            "SELECT topic.sync_topic($1, $2)",
+            vec![text_arg(schema_name), text_arg(topic)],
+        )?
+        .unwrap_or(0))
+    })
 }
 
 #[no_mangle]
@@ -565,6 +591,14 @@ pub extern "C" fn _PG_init() {
             .set_restart_time(Some(Duration::from_secs(5)))
             .enable_spi_access()
             .load();
+        BackgroundWorkerBuilder::new(&format!("pg_topics sync {database}"))
+            .set_type("pg_topics sync")
+            .set_library("pg_topics")
+            .set_function("pg_topics_sync_main")
+            .set_extra(database)
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .enable_spi_access()
+            .load();
     }
 }
 
@@ -617,11 +651,11 @@ mod tests {
         assert!(crate::database_names(" , ").is_empty());
     }
 
-    fn one<T: IntoDatum + FromDatum>(sql: &str) -> Option<T> {
+    pub(crate) fn one<T: IntoDatum + FromDatum>(sql: &str) -> Option<T> {
         Spi::get_one::<T>(sql).unwrap()
     }
 
-    fn error_of(sql: &str) -> Option<String> {
+    pub(crate) fn error_of(sql: &str) -> Option<String> {
         Spi::run(
             "DO $do$ BEGIN
              IF to_regprocedure('pg_temp.error_of(text)') IS NULL THEN
@@ -638,7 +672,7 @@ mod tests {
         .unwrap()
     }
 
-    fn tenant(role: &str) {
+    pub(crate) fn tenant(role: &str) {
         Spi::run(&format!(
             "CREATE ROLE {role}; CREATE SCHEMA {role} AUTHORIZATION {role}"
         ))
@@ -763,10 +797,19 @@ mod tests {
         let offset = error_of("INSERT INTO pgt_forger.forge_q (band, log_offset) VALUES (0, 7)");
         let author =
             error_of("INSERT INTO pgt_forger.forge_q (band, published_by) VALUES (0, 'someone')");
+        let future = error_of(
+            "INSERT INTO pgt_forger.forge_q (band, published_at) VALUES (0, clock_timestamp() + interval '1 minute')",
+        );
         let plain = error_of("INSERT INTO pgt_forger.forge_q (band) VALUES (0)");
         Spi::run("RESET ROLE").unwrap();
         assert!(offset.unwrap().contains("must not set log_offset"));
         assert!(author.unwrap().contains("must not set log_offset"));
+        assert!(
+            future
+                .as_deref()
+                .is_some_and(|e| e.contains("published_at later than the current time")),
+            "{future:?}"
+        );
         assert_eq!(plain, None);
     }
 
@@ -1041,7 +1084,8 @@ mod tests {
         Spi::run("SET LOCAL ROLE pgt_view").unwrap();
         Spi::run(
             "SELECT topic.create_topic('pgt_view.v_q', 1, partition_interval => '1 hour');
-             DROP TABLE pgt_view.v_q;
+             ALTER TABLE pgt_view.v_q RENAME TO gone;
+             DROP TABLE pgt_view.gone;
              CREATE VIEW pgt_view.v_q AS
                  SELECT 0::smallint AS band, 0::bigint AS log_offset, now() AS published_at, 0::bigint AS seq",
         )
@@ -1081,7 +1125,8 @@ mod tests {
         assert_eq!(found(true), Some(vec![]));
         assert_eq!(found(false), Some(vec![]));
         Spi::run(
-            "INSERT INTO public.dup_q (band, value, published_at)
+            "SET LOCAL session_replication_role = replica;
+             INSERT INTO public.dup_q (band, value, published_at)
              VALUES (0, '{}', date_bin('1 hour', now(), '2000-01-01') + interval '1 hour');
              UPDATE public.dup_q SET log_offset = 1 WHERE log_offset IS NULL",
         )

@@ -16,7 +16,6 @@ CREATE TABLE topic.topic_config (
     sync_table         regclass,
     sync_key           text,
     sync_enabled       boolean  NOT NULL DEFAULT false,
-    shape_version      integer  NOT NULL DEFAULT 0,
     backlog_age        interval NOT NULL DEFAULT '0',
     stamped_at         timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (schema_name, topic),
@@ -116,7 +115,7 @@ CREATE FUNCTION topic.refuse_forged_insert() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
-    RAISE EXCEPTION 'topic: an insert into %.% must not set log_offset or published_by',
+    RAISE EXCEPTION 'topic: an insert into %.% must not set log_offset or published_by, or a published_at later than the current time',
         TG_TABLE_SCHEMA, TG_TABLE_NAME;
 END
 $$;
@@ -239,7 +238,7 @@ BEGIN
     EXECUTE format('CREATE INDEX ON %I.%I USING brin (log_offset)', s, t);
     EXECUTE format(
         'CREATE TRIGGER topic_refuse_forged BEFORE INSERT ON %I.%I FOR EACH ROW
-         WHEN (NEW.log_offset IS NOT NULL OR NEW.published_by <> current_user)
+         WHEN (NEW.log_offset IS NOT NULL OR NEW.published_by <> current_user OR NEW.published_at > clock_timestamp())
          EXECUTE FUNCTION topic.refuse_forged_insert()', s, t);
     EXECUTE format(
         'CREATE TRIGGER topic_publish_floor BEFORE INSERT ON %I.%I FOR EACH STATEMENT
@@ -360,6 +359,176 @@ AS $$
           HAVING bool_and(c.offset_retention IS NOT NULL));
 $$;
 
+CREATE FUNCTION topic.attach(
+    base regclass,
+    sync_key text,
+    band_count int DEFAULT 4,
+    retention interval DEFAULT '7 days',
+    min_durability text DEFAULT 'durable'
+) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    who text := topic.caller();
+    s text;
+    t text;
+    base_owner name;
+    queue_owner name;
+    grp text;
+BEGIN
+    SELECT n.nspname, k.relname || '_q', r.rolname INTO s, t, base_owner
+    FROM pg_class k JOIN pg_namespace n ON n.oid = k.relnamespace JOIN pg_roles r ON r.oid = k.relowner
+    WHERE k.oid = attach.base AND k.relkind IN ('r', 'p');
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'topic.attach: % is not an ordinary table', base;
+    END IF;
+    IF NOT pg_has_role(who, base_owner, 'member') THEN
+        RAISE EXCEPTION 'topic.attach: role % is not a member of %, the owner of %', who, base_owner, base
+            USING ERRCODE = '42501';
+    END IF;
+    IF NOT has_schema_privilege(who, s, 'CREATE') THEN
+        RAISE EXCEPTION 'topic.attach: role % has no CREATE privilege on schema %', who, s USING ERRCODE = '42501';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = base AND a.attname = attach.sync_key
+                   AND a.attnum > 0 AND NOT a.attisdropped) THEN
+        RAISE EXCEPTION 'topic.attach: % has no column %', base, attach.sync_key;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = base AND a.attname = attach.sync_key
+                   AND a.attnotnull) THEN
+        RAISE EXCEPTION 'topic.attach: column % of % allows NULL', attach.sync_key, base
+            USING HINT = 'The sync key column must be NOT NULL.';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_attribute a WHERE a.attrelid = base AND a.attname = 'event_at'
+                   AND a.atttypid = 'timestamptz'::regtype AND a.attnotnull AND NOT a.attisdropped) THEN
+        RAISE EXCEPTION 'topic.attach: % has no column event_at timestamptz NOT NULL', base;
+    END IF;
+    IF NOT EXISTS (SELECT FROM topic.topic_config c WHERE c.schema_name = s AND c.topic = t) THEN
+        PERFORM topic.create_topic(s || '.' || t, band_count, retention, min_durability);
+    END IF;
+    SELECT r.rolname INTO queue_owner FROM pg_class k JOIN pg_roles r ON r.oid = k.relowner
+    WHERE k.oid = format('%I.%I', s, t)::regclass;
+    IF NOT pg_has_role(who, queue_owner, 'member') THEN
+        RAISE EXCEPTION 'topic.attach: role % is not a member of %, the owner of %.%', who, queue_owner, s, t
+            USING ERRCODE = '42501';
+    END IF;
+
+    EXECUTE format(
+        'CREATE TABLE %I.%I (
+            band               smallint    NOT NULL,
+            log_offset         bigint      NOT NULL,
+            seq                bigint      NOT NULL,
+            key                varchar(40),
+            value              jsonb,
+            headers            jsonb,
+            published_by       name        NOT NULL,
+            published_at       timestamptz NOT NULL,
+            producer_timestamp timestamptz,
+            failed_at          timestamptz NOT NULL DEFAULT now(),
+            error              text        NOT NULL,
+            PRIMARY KEY (band, log_offset)
+        )', s, t || 'e');
+    EXECUTE format('CREATE INDEX ON %I.%I (failed_at)', s, t || 'e');
+    EXECUTE format('ALTER TABLE %I.%I OWNER TO %I', s, t || 'e', base_owner);
+
+    grp := '__pg_topics_sync:' || s || '.' || t;
+    UPDATE topic.topic_config c SET sync_table = base, sync_key = attach.sync_key, sync_enabled = true
+    WHERE c.schema_name = s AND c.topic = t;
+    INSERT INTO topic.topic_groups (group_name, owner_role) VALUES (grp, base_owner);
+    INSERT INTO topic.topic_offsets (schema_name, topic, group_name, band, owner_role, committed_offset)
+    SELECT p.schema_name, p.topic, grp, p.band, base_owner, p.oldest_offset
+    FROM topic.topic_band_position p WHERE p.schema_name = s AND p.topic = t;
+    RETURN s || '.' || t;
+END
+$$;
+
+CREATE FUNCTION topic.create_table_topic(
+    table_name text,
+    columns json,
+    sync_key text,
+    band_count int DEFAULT 4,
+    retention interval DEFAULT '7 days',
+    min_durability text DEFAULT 'durable'
+) RETURNS text
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    s text := split_part(table_name, '.', 1);
+    t text := substr(table_name, length(s) + 2);
+    defs text := '';
+    c record;
+BEGIN
+    IF json_typeof(columns) IS DISTINCT FROM 'object' THEN
+        RAISE EXCEPTION 'topic.create_table_topic: columns must be a JSON object of "name": "type"';
+    END IF;
+    FOR c IN SELECT * FROM json_each(columns) LOOP
+        IF json_typeof(c.value) <> 'string' OR to_regtype(c.value #>> '{}') IS NULL THEN
+            RAISE EXCEPTION 'topic.create_table_topic: % is not a type', c.value;
+        END IF;
+        defs := defs || format('%I %s, ', c.key,
+            format_type(to_regtype(c.value #>> '{}'), to_regtypemod(c.value #>> '{}')));
+    END LOOP;
+    EXECUTE format('CREATE TABLE %I.%I (%s event_at timestamptz NOT NULL, PRIMARY KEY (%I))', s, t, defs, sync_key);
+    RETURN topic.attach(format('%I.%I', s, t)::regclass, sync_key, band_count, retention, min_durability);
+END
+$$;
+
+CREATE FUNCTION topic.ddl_end() RETURNS event_trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    q record;
+BEGIN
+    FOR q IN
+        SELECT c.schema_name, c.topic, c.band_count,
+               array_agg(pg_get_constraintdef(k.oid)) FILTER (WHERE k.oid IS NOT NULL) AS checks
+        FROM (SELECT DISTINCT d.objid FROM pg_event_trigger_ddl_commands() d
+              WHERE d.classid = 'pg_class'::regclass) d
+        JOIN pg_class r ON r.oid = d.objid
+        JOIN pg_namespace n ON n.oid = r.relnamespace
+        JOIN topic.topic_config c ON c.schema_name = n.nspname AND c.topic = r.relname
+        LEFT JOIN pg_attribute a ON a.attrelid = r.oid AND a.attname = 'band'
+        LEFT JOIN pg_constraint k ON k.conrelid = r.oid AND k.contype = 'c' AND a.attnum = ANY (k.conkey)
+        GROUP BY c.schema_name, c.topic, c.band_count
+    LOOP
+        IF q.checks IS DISTINCT FROM ARRAY[format('CHECK (((band >= 0) AND (band <= %s)))', q.band_count - 1)] THEN
+            RAISE WARNING 'topic: the CHECK constraints on band of %.% are %, which do not match band_count %',
+                q.schema_name, q.topic, q.checks, q.band_count;
+        END IF;
+    END LOOP;
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'topic: the % event trigger failed on %: %', TG_EVENT, TG_TAG, SQLERRM;
+END
+$$;
+
+CREATE FUNCTION topic.sql_drop() RETURNS event_trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        UPDATE topic.topic_config c SET sync_enabled = false
+        FROM pg_event_trigger_dropped_objects() d
+        WHERE c.sync_enabled AND d.classid = 'pg_class'::regclass AND d.objid = c.sync_table
+          AND (d.objsubid = 0 OR d.address_names[3] = c.sync_key)
+        RETURNING c.schema_name, c.topic
+    LOOP
+        RAISE WARNING 'topic: %.% stops syncing, because its base table or its sync key column was dropped',
+            r.schema_name, r.topic;
+    END LOOP;
+    FOR r IN
+        SELECT c.schema_name, c.topic FROM pg_event_trigger_dropped_objects() d
+        JOIN topic.topic_config c ON c.schema_name = d.schema_name AND c.topic = d.object_name
+        WHERE d.classid = 'pg_class'::regclass AND d.objsubid = 0 AND d.object_type = 'table'
+    LOOP
+        DELETE FROM topic.topic_groups g WHERE g.group_name = '__pg_topics_sync:' || r.schema_name || '.' || r.topic;
+        DELETE FROM topic.topic_config c WHERE c.schema_name = r.schema_name AND c.topic = r.topic;
+    END LOOP;
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'topic: the % event trigger failed on %: %', TG_EVENT, TG_TAG, SQLERRM;
+END
+$$;
+
 GRANT USAGE ON SCHEMA topic TO PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA topic FROM PUBLIC;
 SELECT pg_catalog.pg_extension_config_dump('topic.topic_config', '');
@@ -376,3 +545,6 @@ REVOKE EXECUTE ON FUNCTION topic.ensure_partitions(text, text, int) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.retention_next(text, text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.reap() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.check_duplicates(text, text, boolean) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.sync_topic(text, text, int) FROM PUBLIC;
+CREATE EVENT TRIGGER pg_topics_ddl_end ON ddl_command_end EXECUTE FUNCTION topic.ddl_end();
+CREATE EVENT TRIGGER pg_topics_sql_drop ON sql_drop EXECUTE FUNCTION topic.sql_drop();

@@ -340,12 +340,13 @@ chk "the free-form partition keeps its range" \
 
 chk "check_duplicates returns zero rows on a clean topic" 0 \
   "$(psql_as postgres "SELECT count(*) FROM topic.check_duplicates('tenant_b', 'dup_q', full => true)")"
-psql_as postgres "INSERT INTO tenant_b.dup_q (band, value, published_at)
+psql_as postgres "SET session_replication_role = replica;
+                  INSERT INTO tenant_b.dup_q (band, value, published_at)
                   VALUES (0, '{}', date_bin('1 minute', now(), '2000-01-01') + interval '2 minutes');
                   UPDATE tenant_b.dup_q SET log_offset = 0 WHERE log_offset IS NULL" >/dev/null
 chk "check_duplicates returns one row after a duplicate in a second partition" "0|0|2" \
   "$(psql_as postgres "SELECT band, log_offset, copies FROM topic.check_duplicates('tenant_b', 'dup_q', full => true)")"
-psql_as tenant_a "DROP TABLE tenant_a.evil_q;
+psql_as tenant_a "ALTER TABLE tenant_a.evil_q RENAME TO gone; DROP TABLE tenant_a.gone;
                   CREATE VIEW tenant_a.evil_q AS
                   SELECT 0::smallint AS band, 0::bigint AS log_offset, now() AS published_at, 0::bigint AS seq
                   WHERE tenant_a.probe('view', 0::smallint)" >/dev/null
