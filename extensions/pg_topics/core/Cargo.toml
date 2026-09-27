@@ -1,0 +1,12 @@
+[package]
+name = "pg_topics_core"
+version = "0.1.0"
+edition = "2021"
+description = "pg_topics core: pure Rust hot path (Kafka murmur2 partitioner), shared with the pgrx extension"
+license = "PostgreSQL"
+
+[lib]
+name = "pgt"
+path = "src/lib.rs"
+
+[dependencies]
