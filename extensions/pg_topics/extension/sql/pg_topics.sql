@@ -1345,6 +1345,135 @@ BEGIN
 END
 $$;
 
+CREATE VIEW topic.stamp_backlog AS
+    SELECT schema_name, topic, backlog_age, stamped_at FROM topic.topic_config;
+
+CREATE VIEW topic.oldest_xact AS
+    SELECT min(xact_start) AS xact_start, now() - min(xact_start) AS age
+    FROM pg_catalog.pg_stat_activity WHERE xact_start IS NOT NULL;
+
+CREATE VIEW topic.detach_waiting AS
+    SELECT c.schema_name, c.topic, c.detaching::text AS detaching,
+           coalesce(h.inhdetachpending, false) AS pending,
+           EXISTS (SELECT FROM pg_catalog.pg_stat_activity a
+                   WHERE a.backend_type = 'pg_topics partition' AND a.wait_event_type = 'Lock'
+                     AND a.query ILIKE '%DETACH PARTITION%') AS worker_waiting
+    FROM topic.topic_config c
+    LEFT JOIN pg_catalog.pg_inherits h ON h.inhrelid = c.detaching
+    WHERE c.detaching IS NOT NULL;
+
+CREATE VIEW topic.write_partition_dead_tuples AS
+    SELECT c.schema_name, c.topic, s.relname AS partition, s.n_dead_tup
+    FROM topic.topic_config c
+    JOIN pg_catalog.pg_stat_user_tables s
+      ON s.schemaname = c.schema_name
+     AND s.relname = c.topic || '_p' || to_char(
+             date_bin(c.partition_interval, now(), timestamptz '2000-01-01 00:00:00+00') AT TIME ZONE 'UTC',
+             'YYYYMMDDHH24MISS');
+
+CREATE VIEW topic.partition_headroom AS
+    SELECT c.schema_name, c.topic, max(b.upper::timestamptz) - now() AS headroom
+    FROM topic.topic_config c
+    JOIN pg_catalog.pg_inherits h
+      ON h.inhparent = format('%I.%I', c.schema_name, c.topic)::regclass
+    JOIN pg_catalog.pg_class k ON k.oid = h.inhrelid
+    CROSS JOIN LATERAL substring(pg_get_expr(k.relpartbound, k.oid) FROM ' TO \(''([^'']+)''\)$') b(upper)
+    GROUP BY c.schema_name, c.topic;
+
+CREATE VIEW topic.worker_headroom AS
+    SELECT current_setting('max_worker_processes')::int - count(*) AS headroom
+    FROM pg_catalog.pg_stat_activity
+    WHERE backend_type NOT IN ('client backend', 'walsender', 'background writer', 'checkpointer',
+                                'walwriter', 'archiver', 'startup', 'walreceiver', 'walsummarizer',
+                                'autovacuum launcher', 'autovacuum worker', 'slotsync worker');
+
+CREATE VIEW topic.listener_status AS
+    SELECT datname, pid, query FROM pg_catalog.pg_stat_activity WHERE backend_type = 'pg_topics listener';
+
+CREATE VIEW topic.group_expiry AS
+    SELECT group_name, expired_members FROM topic.topic_groups;
+
+CREATE FUNCTION topic.error_rows() RETURNS TABLE (schema_name text, topic text, rows bigint, recent bigint)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    c record;
+BEGIN
+    FOR c IN SELECT t.schema_name, t.topic FROM topic.topic_config t WHERE t.sync_table IS NOT NULL LOOP
+        RETURN QUERY EXECUTE format(
+            'SELECT %L::text, %L::text, count(*), count(*) FILTER (WHERE failed_at > now() - interval ''1 hour'')
+             FROM %I.%I',
+            c.schema_name, c.topic, c.schema_name, c.topic || 'e');
+    END LOOP;
+END
+$$;
+
+CREATE VIEW topic.producer_rows AS
+    SELECT schema_name, topic, count(*) AS rows FROM topic.topic_producers GROUP BY schema_name, topic;
+
+CREATE VIEW topic.syncrep_waiters AS
+    SELECT pid, usename, query FROM pg_catalog.pg_stat_activity WHERE wait_event = 'SyncRep';
+
+CREATE VIEW topic.sync_lag AS
+    SELECT o.schema_name, o.topic, o.band, p.next_offset - o.committed_offset AS lag
+    FROM topic.topic_offsets o
+    JOIN topic.topic_band_position p
+      ON p.schema_name = o.schema_name AND p.topic = o.topic AND p.band = o.band
+    WHERE o.group_name = '__pg_topics_sync:' || o.schema_name || '.' || o.topic;
+
+CREATE VIEW topic.consumer_lag AS
+    SELECT o.schema_name, o.topic, o.group_name, o.band, p.next_offset - o.committed_offset AS lag
+    FROM topic.topic_offsets o
+    JOIN topic.topic_band_position p
+      ON p.schema_name = o.schema_name AND p.topic = o.topic AND p.band = o.band;
+
+CREATE FUNCTION topic.duplicate_offsets()
+RETURNS TABLE (schema_name text, topic text, band smallint, log_offset bigint, copies bigint)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    c record;
+BEGIN
+    FOR c IN SELECT t.schema_name, t.topic FROM topic.topic_config t LOOP
+        RETURN QUERY
+        SELECT c.schema_name, c.topic, d.band, d.log_offset, d.copies
+        FROM topic.check_duplicates(c.schema_name, c.topic, false) d;
+    END LOOP;
+END
+$$;
+
+CREATE FUNCTION topic.health() RETURNS TABLE (
+    schema_name text,
+    topic text,
+    backlog_age interval,
+    stamped_at timestamptz,
+    partition_headroom interval,
+    listener_bound boolean,
+    duplicate boolean,
+    syncrep_waiting boolean,
+    ok boolean
+)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+    WITH listener AS (
+        SELECT coalesce(bool_or(query LIKE 'listening on port%'), false) AS bound
+        FROM pg_catalog.pg_stat_activity WHERE backend_type = 'pg_topics listener'),
+    syncrep AS (
+        SELECT EXISTS (SELECT FROM pg_catalog.pg_stat_activity WHERE wait_event = 'SyncRep') AS waiting),
+    duplicates AS (SELECT DISTINCT d.schema_name, d.topic FROM topic.duplicate_offsets() d)
+    SELECT c.schema_name, c.topic, c.backlog_age, c.stamped_at, h.headroom, listener.bound,
+           dd.schema_name IS NOT NULL, syncrep.waiting,
+           now() - c.stamped_at <= c.max_backlog_age / 2
+               AND coalesce(h.headroom, interval '0') >= least(interval '1 day', c.partition_interval)
+               AND listener.bound
+               AND dd.schema_name IS NULL
+               AND NOT syncrep.waiting
+    FROM topic.topic_config c
+    LEFT JOIN topic.partition_headroom h ON h.schema_name = c.schema_name AND h.topic = c.topic
+    LEFT JOIN duplicates dd ON dd.schema_name = c.schema_name AND dd.topic = c.topic
+    CROSS JOIN listener CROSS JOIN syncrep
+$$;
+
 GRANT USAGE ON SCHEMA topic TO PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA topic FROM PUBLIC;
 SELECT pg_catalog.pg_extension_config_dump('topic.topic_config', '');
@@ -1371,5 +1500,12 @@ REVOKE EXECUTE ON FUNCTION topic.expire_members(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.group_protocol(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.group_enter(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.expire_groups() FROM PUBLIC;
+GRANT SELECT ON topic.stamp_backlog, topic.oldest_xact, topic.detach_waiting, topic.write_partition_dead_tuples,
+    topic.partition_headroom, topic.worker_headroom, topic.listener_status, topic.group_expiry,
+    topic.producer_rows, topic.syncrep_waiters, topic.sync_lag, topic.consumer_lag TO pg_monitor;
+REVOKE EXECUTE ON FUNCTION topic.error_rows() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.duplicate_offsets() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.health() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION topic.error_rows(), topic.duplicate_offsets(), topic.health() TO pg_monitor;
 CREATE EVENT TRIGGER pg_topics_ddl_end ON ddl_command_end EXECUTE FUNCTION topic.ddl_end();
 CREATE EVENT TRIGGER pg_topics_sql_drop ON sql_drop EXECUTE FUNCTION topic.sql_drop();

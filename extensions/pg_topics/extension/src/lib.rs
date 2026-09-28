@@ -1906,6 +1906,26 @@ mod tests {
         assert_eq!(used_after("2 minutes", 0), Some("00:00:00".into()));
         assert_eq!(used_after("30 seconds", 10), Some("00:00:30".into()));
     }
+
+    #[pg_test]
+    fn health_returns_one_row_per_topic() {
+        Spi::run(
+            "SELECT topic.create_topic('public.health_a_q', 1);
+             SELECT topic.create_topic('public.health_b_q', 2)",
+        )
+        .unwrap();
+        assert_eq!(
+            one::<i64>("SELECT count(*) FROM topic.health()"),
+            one::<i64>("SELECT count(*) FROM topic.topic_config")
+        );
+        assert_eq!(
+            one::<i64>(
+                "SELECT count(DISTINCT (schema_name, topic)) FROM topic.health()
+                 WHERE (schema_name, topic) IN (('public', 'health_a_q'), ('public', 'health_b_q'))"
+            ),
+            Some(2)
+        );
+    }
 }
 
 #[cfg(test)]
