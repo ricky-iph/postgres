@@ -107,7 +107,6 @@ pub fn decode_produce(mut records: Bytes, budget: &Budget) -> Result<Vec<Record>
 mod tests {
     use super::*;
     use bytes::BytesMut;
-    use kafka_protocol::indexmap::IndexMap;
     use kafka_protocol::records::{RecordBatchEncoder, RecordEncodeOptions, TimestampType};
 
     fn record(offset: i64) -> Record {
@@ -124,7 +123,7 @@ mod tests {
             timestamp: 1_700_000_000_000 + offset,
             key: Some(Bytes::from_static(b"k")),
             value: Some(Bytes::from_static(b"{\"a\": 1}")),
-            headers: IndexMap::new(),
+            headers: Vec::new(),
         }
     }
 
@@ -183,6 +182,36 @@ mod tests {
             assert_eq!(records.len(), 2, "{compression:?}");
             assert_eq!(records[1].value.as_deref(), Some(&b"{\"a\": 1}"[..]));
         }
+    }
+
+    #[test]
+    fn decode_produce_keeps_every_header_in_order() {
+        let mut r = record(0);
+        r.headers = [
+            ("a".into(), Some(Bytes::from_static(b"1"))),
+            ("a".into(), Some(Bytes::from_static(b"2"))),
+            ("bin".into(), Some(Bytes::from_static(b"\xff\x00\x01"))),
+            ("n".into(), None),
+            ("e".into(), Some(Bytes::new())),
+        ]
+        .into();
+        let buf = encode(&[r], Compression::None);
+        let records = decode_produce(buf.freeze(), &Budget::new(1 << 20)).unwrap();
+        let headers: Vec<(&str, Option<&[u8]>)> = records[0]
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_deref()))
+            .collect();
+        assert_eq!(
+            headers,
+            vec![
+                ("a", Some(&b"1"[..])),
+                ("a", Some(&b"2"[..])),
+                ("bin", Some(&b"\xff\x00\x01"[..])),
+                ("n", None),
+                ("e", Some(&b""[..])),
+            ]
+        );
     }
 
     #[test]

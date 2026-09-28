@@ -42,7 +42,6 @@ use anyhow::{anyhow, bail, Result};
 use bytes::{Bytes, BytesMut};
 use crc::{Crc, CRC_32_ISO_HDLC};
 use crc32c::crc32c;
-use indexmap::IndexMap;
 
 use crate::protocol::{
     buf::{gap, ByteBuf, ByteBufMut},
@@ -181,7 +180,7 @@ pub struct Record {
     /// The payload of the record.
     pub value: Option<Bytes>,
     /// Headers associated with the record's payload.
-    pub headers: IndexMap<StrBytes, Option<Bytes>>,
+    pub headers: Vec<(StrBytes, Option<Bytes>)>,
 }
 
 const MAGIC_BYTE_OFFSET: usize = 16;
@@ -893,7 +892,7 @@ impl Record {
         }
         let num_headers = num_headers as usize;
 
-        let mut headers = IndexMap::with_capacity(num_headers.min(bytes::Buf::remaining(buf)));
+        let mut headers = Vec::with_capacity(num_headers.min(bytes::Buf::remaining(buf)));
         for _ in 0..num_headers {
             // Key len
             let key_len: i32 = types::VarInt.decode(buf)?;
@@ -916,7 +915,7 @@ impl Record {
                 Ordering::Greater => Some(buf.try_get_bytes(value_len as usize)?),
             };
 
-            headers.insert(key, value);
+            headers.push((key, value));
         }
 
         Ok(Self {
@@ -1029,8 +1028,8 @@ mod tests {
             Bytes::from("some-value"),
             record
                 .headers
-                // This relies on `impl Borrow<[u8]> for StrBytes`
-                .get("some-key".as_bytes())
+                .iter()
+                .find_map(|(k, v)| (k.as_bytes() == b"some-key").then_some(v))
                 .expect("key exists in headers")
                 .as_ref()
                 .expect("value is present")

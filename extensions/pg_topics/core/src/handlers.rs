@@ -1,8 +1,9 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use bytes::{Bytes, BytesMut};
-use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
 use kafka_protocol::messages::list_offsets_response::{
@@ -44,7 +45,9 @@ const FETCH_SQL: &str = "SELECT f.log_offset, f.key, f.value::text, h.keys, h.va
         floor(extract(epoch FROM f.published_at) * 1000)::int8
     FROM topic.fetch($1, $2, $3, $4) f
     LEFT JOIN LATERAL (
-        SELECT array_agg(e->>'key' ORDER BY n) AS keys, array_agg(e->>'value' ORDER BY n) AS vals
+        SELECT array_agg(e->>'key' ORDER BY n) AS keys,
+               array_agg(CASE WHEN e ? 'value_base64' THEN topic.wire_bytes(e->'value_base64')
+                              ELSE convert_to(e->>'value', 'UTF8') END ORDER BY n) AS vals
         FROM jsonb_array_elements(CASE WHEN jsonb_typeof(f.headers) = 'array' THEN f.headers END)
              WITH ORDINALITY x(e, n)
         WHERE jsonb_typeof(e) = 'object' AND e->>'key' IS NOT NULL) h ON true
@@ -262,10 +265,19 @@ fn rows(records: &[Record]) -> Option<Rows> {
             for (i, (k, v)) in r.headers.iter().enumerate() {
                 json.push_str(if i == 0 { "{\"key\":" } else { ",{\"key\":" });
                 json_string(&mut json, k.as_str());
-                json.push_str(",\"value\":");
                 match v {
-                    Some(v) => json_string(&mut json, &text(v)?),
-                    None => json.push_str("null"),
+                    Some(v) => match std::str::from_utf8(v) {
+                        Ok(v) => {
+                            json.push_str(",\"value\":");
+                            json_string(&mut json, v);
+                        }
+                        Err(_) => {
+                            json.push_str(",\"value_base64\":\"");
+                            STANDARD.encode_string(v, &mut json);
+                            json.push('"');
+                        }
+                    },
+                    None => json.push_str(",\"value\":null"),
                 }
                 json.push('}');
             }
@@ -517,14 +529,14 @@ fn read_band(
         let key: Option<String> = row.try_get(1)?;
         let value: Option<String> = row.try_get(2)?;
         let keys: Option<Vec<String>> = row.try_get(3)?;
-        let vals: Option<Vec<Option<String>>> = row.try_get(4)?;
-        let mut headers = IndexMap::new();
+        let vals: Option<Vec<Option<Vec<u8>>>> = row.try_get(4)?;
+        let mut headers = Vec::new();
         for (k, v) in keys
             .unwrap_or_default()
             .into_iter()
             .zip(vals.unwrap_or_default())
         {
-            headers.insert(StrBytes::from_string(k), v.map(Bytes::from));
+            headers.push((StrBytes::from_string(k), v.map(Bytes::from)));
         }
         let len = 24
             + key.as_ref().map_or(0, String::len)
@@ -781,33 +793,51 @@ mod tests {
             timestamp: -1,
             key: key.map(Bytes::from_static),
             value: value.map(Bytes::from_static),
-            headers: IndexMap::new(),
+            headers: Vec::new(),
         }
     }
 
     #[test]
-    fn rows_refuse_bad_keys_and_header_values() {
+    fn rows_refuse_bad_keys_and_values() {
         let long = b"0123456789012345678901234567890123456789x";
         assert!(rows(&[record(Some(&long[..40]), Some(b"{}"))]).is_some());
         assert!(rows(&[record(Some(long), Some(b"{}"))]).is_none());
         assert!(rows(&[record(Some(b"\xff"), None)]).is_none());
         assert!(rows(&[record(None, Some(b"\xc3"))]).is_none());
-        let mut bad_header = record(None, None);
-        bad_header.headers.insert(
-            StrBytes::from_static_str("h"),
-            Some(Bytes::from_static(b"\xff")),
+    }
+
+    #[test]
+    fn rows_keep_repeated_binary_null_and_empty_header_values() {
+        let mut r = record(None, None);
+        r.headers = [
+            ("a".into(), Some(Bytes::from_static(b"1"))),
+            ("a".into(), Some(Bytes::from_static(b"2"))),
+            ("bin".into(), Some(Bytes::from_static(b"\xff\x00\x01"))),
+            ("n".into(), None),
+            ("e".into(), Some(Bytes::new())),
+        ]
+        .into();
+        assert_eq!(
+            rows(&[r]).map(|rows| rows.headers),
+            Some(vec![Some(
+                concat!(
+                    r#"[{"key":"a","value":"1"},{"key":"a","value":"2"},"#,
+                    r#"{"key":"bin","value_base64":"/wAB"},{"key":"n","value":null},"#,
+                    r#"{"key":"e","value":""}]"#
+                )
+                .to_string()
+            )])
         );
-        assert!(rows(&[bad_header]).is_none());
     }
 
     #[test]
     fn rows_write_headers_as_a_json_array() {
         let mut r = record(Some("Zürich".as_bytes()), None);
-        r.headers.insert(
+        r.headers.push((
             StrBytes::from_static_str("a\"b"),
             Some(Bytes::from_static(b"x\n\\")),
-        );
-        r.headers.insert(StrBytes::from_static_str("n"), None);
+        ));
+        r.headers.push((StrBytes::from_static_str("n"), None));
         let rows = rows(&[r]).unwrap();
         assert_eq!(rows.keys, vec![Some("Zürich".to_string())]);
         assert_eq!(rows.values, vec![None]);

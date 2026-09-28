@@ -149,6 +149,14 @@ SELECT * FROM topic.fetch('public.orders_q', band => 0, from_offset => 0);
 SELECT * FROM topic.band_offsets('public.orders_q');
 ```
 
+`fetch` returns the record headers as they are stored: a JSON array in the
+order of the Kafka record, for example
+`[{"key": "a", "value": "1"}, {"key": "bin", "value_base64": "/wAB"}, {"key": "n", "value": null}]`.
+A value that is valid UTF-8 is text in `value`. Any other value is standard
+base64 in `value_base64`. A null value is `"value": null`. One name can occur
+more than one time. Give `publish` headers in the same format, and a Kafka
+consumer gets the same bytes.
+
 Commit a position without joining a group first, the way a simple SQL reader
 does:
 
@@ -359,8 +367,6 @@ from whatever already scrapes Postgres; it needs no separate exporter.
 - `Metadata` lists one replica for each band, also for a topic made with a
   replication factor above 1. Read `pg_topics.replication_factor` for the
   real number of copies (see [Replication factor](#replication-factor)).
-- A Kafka record may carry two headers with the same name. `pg_topics` keeps
-  only one of them.
 - Publishing to a topic means trusting its owner. A trigger the owner puts on
   the queue table runs as the publisher, the same as any Postgres trigger.
 - A producer identity that sits idle for more than 7 days is reaped. The

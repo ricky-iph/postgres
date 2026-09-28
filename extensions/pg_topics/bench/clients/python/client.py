@@ -64,6 +64,21 @@ def produce(topic, count, mode="json", compression="none", keys="", partition=-1
     print("left", left, flush=True)
 
 
+def produce_headers(topic):
+    p = Producer(base())
+    p.produce(topic, value=b'{"h": 1}', partition=0, on_delivery=report,
+              headers=[("a", b"1"), ("a", b"2"), ("bin", b"\xff\x00\x01"), ("n", None)])
+    print("left", p.flush(10), flush=True)
+
+
+def headers(topic):
+    c = consumer()
+    c.assign([TopicPartition(topic, 0, 0)])
+    m = c.poll(20)
+    print("headers", None if m is None or m.error() else m.headers(), flush=True)
+    c.close()
+
+
 def consume(topic, partition, offset, count, reset="earliest", cfg=""):
     c = consumer(**{"auto.offset.reset": reset, **{k: int(v) for k, v in
                     (item.split("=") for item in cfg.split(",") if item)}})
@@ -368,7 +383,7 @@ if __name__ == "__main__":
     {"produce": produce, "consume": consume, "offsets": offsets, "latency": latency, "metadata": metadata,
      "traffic": traffic, "raw": raw, "member": member, "idempotent": idempotent, "transactional": transactional,
      "group_offsets": group_offsets, "commit": commit, "committed": committed,
-     "produce_partition": produce_partition,
+     "produce_partition": produce_partition, "produce_headers": produce_headers, "headers": headers,
      "create_topic": create_topic, "create_topic_validate_only": create_topic_validate_only,
      "delete_topic": delete_topic,
      "legacy_alter": legacy_alter, "incremental_alter": incremental_alter, "cluster_id": cluster_id,

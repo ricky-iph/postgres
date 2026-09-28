@@ -10,7 +10,7 @@ psql_as postgres "CREATE ROLE alice LOGIN PASSWORD 'alice-pw'; CREATE SCHEMA ali
   CREATE ROLE carol LOGIN PASSWORD 'carol-pw'; GRANT USAGE ON SCHEMA alice TO carol;
   CREATE ROLE slow LOGIN PASSWORD 'slow-pw'; CREATE SCHEMA slow AUTHORIZATION slow;
   ALTER ROLE slow SET statement_timeout = '3s'; ALTER ROLE slow SET log_statement = 'all'" >/dev/null
-for t in java_q:1 keyed_q:4 codec_q:1 bad_q:1 wait_q:1 old_q:1 err_q:1 time_q:1 acks_q:1 big_q:1 mem_q:1; do
+for t in java_q:1 keyed_q:4 codec_q:1 bad_q:1 wait_q:1 old_q:1 err_q:1 time_q:1 acks_q:1 big_q:1 mem_q:1 hdr_q:1; do
   psql_as alice "SELECT topic.create_topic('alice.${t%:*}', ${t#*:})" >/dev/null
 done
 psql_as alice "GRANT INSERT (band, key, value, headers, producer_timestamp) ON alice.keyed_q TO bob;
@@ -50,6 +50,20 @@ chk "every key lands on band_for(key, 4), as with murmur2_random" 0 \
 chk "the keys spread over all 4 bands" 4 "$(psql_as postgres "SELECT count(DISTINCT band) FROM alice.keyed_q")"
 chk "the headers are stored as a JSON array of key and value" '[{"key": "n", "value": "7"}]' \
   "$(psql_as postgres "SELECT headers FROM alice.keyed_q WHERE key = 'key-7'")"
+chk "librdkafka produces a record with repeated, binary and null headers" "ok 0 None" \
+  "$(kafka_py alice alice-pw produce_headers alice.hdr_q | grep '^ok' || true)"
+chk "the headers are stored in order, and a value that is not UTF-8 is stored as value_base64" \
+  '[{"key": "a", "value": "1"}, {"key": "a", "value": "2"}, {"key": "bin", "value_base64": "/wAB"}, {"key": "n", "value": null}]' \
+  "$(psql_as postgres "SELECT headers FROM alice.hdr_q")"
+wait_for "[ \"\$(unstamped alice.hdr_q)\" = 0 ]"
+chk "a librdkafka consumer reads back the same headers, in order" \
+  "headers [('a', b'1'), ('a', b'2'), ('bin', b'\\xff\\x00\\x01'), ('n', None)]" \
+  "$(kafka_py alice alice-pw headers alice.hdr_q | grep '^headers' || true)"
+chk "a Java consumer with print.headers=true reads back the same header bytes, in order" \
+  "613a312c613a322c62696e3aff00012c6e3a6e756c6c" \
+  "$(kafka_java kafka-console-consumer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic alice.hdr_q \
+     --partition 0 --offset 0 --max-messages 1 --timeout-ms 20000 --consumer.config /w/alice.properties \
+     --property print.headers=true --property print.value=false | grep -a '^a:' | head -c -1 | od -An -tx1 | tr -d ' \n')"
 
 for c in none gzip snappy lz4 zstd; do
   out=$(kafka_py alice alice-pw produce alice.codec_q 10 json "$c")

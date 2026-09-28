@@ -1141,6 +1141,7 @@ name = "pg_topics_core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "crc32c",
  "flate2",

@@ -125,7 +125,6 @@ impl<B: ByteBuf> Decompressor<B> for Snappy {
 #[cfg(test)]
 mod tests {
     use bytes::{Buf as _, Bytes, BytesMut};
-    use indexmap::IndexMap;
 
     use crate::records::{
         Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
@@ -149,7 +148,7 @@ mod tests {
             timestamp: Default::default(),
             key: None,
             value: Some(Bytes::from_static(b"sdfdsf")),
-            headers: IndexMap::default(),
+            headers: Vec::new(),
         };
 
         // The module doesn't expose record encode/decode directly so we have to put everything
@@ -212,7 +211,7 @@ mod tests {
             timestamp: Default::default(),
             key: None,
             value: Some(Bytes::from_static(b"sdfdsf")),
-            headers: IndexMap::default(),
+            headers: Vec::new(),
         };
         RecordBatchEncoder::encode(
             &mut expected_bytes,
@@ -257,7 +256,7 @@ mod tests {
             timestamp: Default::default(),
             key: None,
             value: Some(Bytes::from_static(b"sdfdsf")),
-            headers: IndexMap::default(),
+            headers: Vec::new(),
         };
         RecordBatchEncoder::encode(
             &mut expected_bytes,
