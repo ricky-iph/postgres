@@ -197,6 +197,7 @@ jobs:
           bash bench/run_kafka_admin.sh
           bash bench/run_security.sh
           bash bench/run_monitoring.sh
+          bash bench/run_failover.sh
 
       - name: pg_topics untouched
         if: needs.changes.outputs.pgt != 'true'

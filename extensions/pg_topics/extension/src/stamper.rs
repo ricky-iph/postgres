@@ -62,8 +62,9 @@ fn stamp(schema_name: &str, topic: &str, max_rows: i32, skip_locked: bool) -> sp
         names(),
     )?;
     let node = Spi::get_one::<String>(
-        "SELECT s.system_identifier || '/' || c.timeline_id
-         FROM pg_catalog.pg_control_system() s, pg_catalog.pg_control_checkpoint() c",
+        "SELECT s.system_identifier || '/'
+                || ('x' || left(pg_catalog.pg_walfile_name(pg_catalog.pg_current_wal_insert_lsn()), 8))::bit(32)::int
+         FROM pg_catalog.pg_control_system() s",
     )?
     .unwrap_or_default();
 

@@ -96,7 +96,7 @@ as not bound (see [Monitoring](#monitoring)).
 |---|---|---|
 | `pg_topics.databases` | (none) | The databases that get the four workers. A comma list. Needs a restart. |
 | `pg_topics.failover_is_fenced` | `off` | The operator has fenced the old primary on failover. A topic may not ask for `durable` or `replicated` until this is `on`. |
-| `pg_topics.port` | `9092` | The Kafka listener's TCP port. `0` means no listener. Set it per database with `ALTER DATABASE ... SET`. |
+| `pg_topics.port` | `9092` | The Kafka listener's TCP port. `0` means no listener. Set it per database with `ALTER DATABASE ... SET`. That setting replicates, so a standby on the same host must set its own port in its `postgresql.conf`. |
 | `pg_topics.advertised_host` | `localhost` | The host name `Metadata` gives to a Kafka client for reconnecting. Set it to a reachable name. |
 | `pg_topics.max_clients` | `100` | The most Kafka clients the listener accepts at once. Each one holds a Postgres connection; keep `max_connections` above this. |
 | `pg_topics.max_message_bytes` | `1048576` | The largest record batch `Produce` accepts. A larger batch gets `MESSAGE_TOO_LARGE`. |
