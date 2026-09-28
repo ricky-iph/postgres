@@ -136,6 +136,38 @@ def raw(request):
         print("raw timeout", flush=True)
 
 
+def produce_partition(topic, partition):
+    import struct
+
+    def string(text):
+        return struct.pack(">h", len(text.encode())) + text.encode()
+
+    def read(t, n):
+        data = b""
+        while len(data) < n:
+            chunk = t.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError("the listener closed the connection")
+            data += chunk
+        return data
+
+    def call(t, key, version, body):
+        request = struct.pack(">hhi", key, version, 1) + string("raw") + body
+        t.sendall(struct.pack(">i", len(request)) + request)
+        return read(t, struct.unpack(">i", read(t, 4))[0])[4:]
+
+    host, port = os.environ["BOOTSTRAP"].split(":")
+    tls = ssl.create_default_context(cafile="/w/server.crt")
+    with socket.create_connection((host, int(port))) as s, tls.wrap_socket(s, server_hostname=host) as t:
+        call(t, 17, 1, string("PLAIN"))
+        auth = f"\0{os.environ['KAFKA_USER']}\0{os.environ['KAFKA_PASSWORD']}".encode()
+        call(t, 36, 0, struct.pack(">i", len(auth)) + auth)
+        r = call(t, 0, 3, struct.pack(">hhii", -1, -1, 10000, 1) + string(topic)
+                 + struct.pack(">iii", 1, int(partition), 0))
+    at = 6 + struct.unpack(">h", r[4:6])[0] + 8
+    print("produce_partition", struct.unpack(">h", r[at:at + 2])[0], flush=True)
+
+
 def traffic(topic, seconds):
     p = Producer({**base(), "linger.ms": 5, "message.timeout.ms": 120000})
     c = consumer(**{"auto.offset.reset": "earliest"})
@@ -222,6 +254,26 @@ def group_offsets(group):
             print("offset", tp.topic, tp.partition, tp.offset, tp.error.name() if tp.error else "NONE", flush=True)
 
 
+def commit(topic, partition, offset, group):
+    c = consumer(**{"group.id": group})
+    try:
+        for tp in c.commit(offsets=[TopicPartition(topic, int(partition), int(offset))], asynchronous=False):
+            print("commit", tp.error.name() if tp.error else "NONE", flush=True)
+    except KafkaException as e:
+        print("commit", e.args[0].name(), flush=True)
+    c.close()
+
+
+def committed(topic, partition, group):
+    c = consumer(**{"group.id": group})
+    try:
+        for tp in c.committed([TopicPartition(topic, int(partition))], timeout=10):
+            print("committed", tp.error.name() if tp.error else tp.offset, flush=True)
+    except KafkaException as e:
+        print("committed", e.args[0].name(), flush=True)
+    c.close()
+
+
 def create_topic_validate_only(topic, partitions):
     from confluent_kafka.admin import AdminClient, NewTopic
     admin = AdminClient(base())
@@ -290,7 +342,8 @@ def describe_config_sources(topic):
 if __name__ == "__main__":
     {"produce": produce, "consume": consume, "offsets": offsets, "latency": latency, "metadata": metadata,
      "traffic": traffic, "raw": raw, "member": member, "idempotent": idempotent, "transactional": transactional,
-     "group_offsets": group_offsets,
+     "group_offsets": group_offsets, "commit": commit, "committed": committed,
+     "produce_partition": produce_partition,
      "create_topic_validate_only": create_topic_validate_only, "delete_topic": delete_topic,
      "legacy_alter": legacy_alter, "incremental_alter": incremental_alter, "cluster_id": cluster_id,
      "describe_config_sources": describe_config_sources}[sys.argv[1]](*sys.argv[2:])

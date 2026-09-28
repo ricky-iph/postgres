@@ -93,7 +93,7 @@ for i in 1 2 3 4 5; do
 done
 chk "while one topic fails, the other topics are stamped within 300 ms" "yes yes yes yes yes " "$latencies"
 chk "the stamper releases the lock of the failed topic" yes \
-  "$(wait_for "[ \"\$(psql_as postgres \"SELECT pg_try_advisory_lock($STAMP_LOCK_NS, hashtext('public.bad_q'))\")\" = t ]" && echo yes || echo no)"
+  "$(wait_for "[ \"\$(psql_as postgres \"SELECT EXISTS (SELECT FROM topic.topic_band_position WHERE schema_name = 'public' AND topic = 'bad_q' AND band = 0 FOR NO KEY UPDATE SKIP LOCKED)\")\" = t ]" && echo yes || echo no)"
 psql_as postgres "DROP TRIGGER refuse ON public.bad_q" >/dev/null
 wait_for "[ \"\$(unstamped public.bad_q)\" = 0 ]"
 chk "the failed topic is stamped after the fault is gone" 0 "$(unstamped public.bad_q)"

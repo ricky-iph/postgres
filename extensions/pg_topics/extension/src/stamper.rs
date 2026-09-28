@@ -4,12 +4,22 @@ use pgrx::spi::{self, quote_qualified_identifier};
 
 use crate::{as_owner, queue_owner, read_one, text_arg, topic_worker};
 
-const STAMP_LOCK: i32 = 0x7067_7473;
-
 #[pg_extern]
 #[search_path(pg_catalog, pg_temp)]
 fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -> spi::Result<i32> {
+    stamp(schema_name, topic, max_rows, false)
+}
+
+fn stamp(schema_name: &str, topic: &str, max_rows: i32, skip_locked: bool) -> spi::Result<i32> {
     let names = || vec![text_arg(schema_name), text_arg(topic)];
+    let taken = || -> spi::Result<bool> {
+        Ok(!skip_locked
+            || Spi::get_one_with_args::<bool>(
+                "SELECT EXISTS (SELECT FROM topic.topic_band_position
+                                WHERE schema_name = $1 AND topic = $2 AND band = 0 FOR NO KEY UPDATE SKIP LOCKED)",
+                names(),
+            )? == Some(true))
+    };
     let owner = queue_owner("topic.stamp_topic", schema_name, topic)?;
     let queue = quote_qualified_identifier(schema_name, topic);
     let beat = |backlog: Option<Interval>| {
@@ -20,7 +30,7 @@ fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -
              FROM topic.topic_config WHERE schema_name = $1 AND topic = $2",
             args.clone(),
         )?;
-        if stale != Some(true) {
+        if stale != Some(true) || !taken()? {
             return Ok(());
         }
         Spi::run_with_args(
@@ -42,10 +52,13 @@ fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -
         beat(Interval::new(0, 0, 0).ok())?;
         return Ok(0);
     }
+    if !taken()? {
+        return Ok(0);
+    }
     let (next, stamped_by) = Spi::get_two_with_args::<Vec<i64>, Vec<Option<String>>>(
         "SELECT array_agg(next_offset ORDER BY band), array_agg(stamped_by ORDER BY band)
          FROM (SELECT band, next_offset, stamped_by FROM topic.topic_band_position
-               WHERE schema_name = $1 AND topic = $2 FOR UPDATE) b",
+               WHERE schema_name = $1 AND topic = $2 FOR NO KEY UPDATE) b",
         names(),
     )?;
     let node = Spi::get_one::<String>(
@@ -127,21 +140,7 @@ fn stamp_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 10000)) -
 }
 
 fn stamp_locked(schema_name: &str, topic: &str) -> spi::Result<i32> {
-    let args = || {
-        vec![
-            text_arg(schema_name),
-            text_arg(topic),
-            (PgBuiltInOids::INT4OID.oid(), STAMP_LOCK.into_datum()),
-        ]
-    };
-    if read_one::<bool>(
-        "SELECT pg_catalog.pg_try_advisory_xact_lock($3, pg_catalog.hashtext($1 || '.' || $2))",
-        args(),
-    )? != Some(true)
-    {
-        return Ok(0);
-    }
-    Ok(read_one::<i32>("SELECT topic.stamp_topic($1, $2)", args())?.unwrap_or(0))
+    stamp(schema_name, topic, 10000, true)
 }
 
 #[no_mangle]

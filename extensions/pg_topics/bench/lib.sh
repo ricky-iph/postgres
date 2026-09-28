@@ -56,8 +56,6 @@ wait_for() {
   return 1
 }
 
-STAMP_LOCK_NS=1885828211
-
 cleanup() {
   kill $(jobs -p) 2>/dev/null || true
   stop_pg >/dev/null 2>&1 || true
@@ -87,8 +85,9 @@ unstamped() {
 }
 
 hold_stamp_lock() {
-  "$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d postgres -q -o /dev/null \
-    -c "SELECT pg_advisory_lock($STAMP_LOCK_NS, hashtext('$1'))" -c "SELECT pg_sleep(3600)" >/dev/null 2>&1 &
+  "$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d postgres -q -o /dev/null -c "BEGIN" \
+    -c "SELECT FROM topic.topic_band_position WHERE schema_name || '.' || topic = '$1' AND band = 0 FOR NO KEY UPDATE" \
+    -c "SELECT pg_sleep(3600)" >/dev/null 2>&1 &
   wait_for "[ \"\$(psql_as postgres \"SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'PgSleep'\")\" = 1 ]"
 }
 

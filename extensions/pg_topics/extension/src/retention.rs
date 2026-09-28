@@ -51,7 +51,7 @@ fn retention_floor(
     let (bands, next) = Spi::get_two_with_args::<Vec<i16>, Vec<i64>>(
         "SELECT array_agg(band ORDER BY band), array_agg(next_offset ORDER BY band)
          FROM (SELECT band, next_offset FROM topic.topic_band_position
-               WHERE schema_name = $1 AND topic = $2 FOR UPDATE) b",
+               WHERE schema_name = $1 AND topic = $2 FOR NO KEY UPDATE) b",
         vec![text_arg(schema_name), text_arg(topic)],
     )?;
     let (bands, next) = (bands.unwrap_or_default(), next.unwrap_or_default());

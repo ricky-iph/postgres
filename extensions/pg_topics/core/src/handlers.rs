@@ -379,7 +379,14 @@ pub fn produce(
     for t in &req.topic_data {
         let (schema, table) = split(t.name.as_str());
         band_counts.push(
-            db.query_one("SELECT topic.band_count($1, $2)", &[&schema, &table])?
+            db.query_one(
+                "SELECT CASE WHEN EXISTS (
+                     SELECT FROM pg_catalog.pg_class r JOIN pg_catalog.pg_namespace n ON n.oid = r.relnamespace
+                     WHERE n.nspname = $1 AND r.relname = $2
+                       AND pg_catalog.has_any_column_privilege(r.oid, 'INSERT'))
+                 THEN topic.band_count($1, $2) END",
+                &[&schema, &table],
+            )?
                 .try_get::<_, Option<i16>>(0)?,
         );
     }

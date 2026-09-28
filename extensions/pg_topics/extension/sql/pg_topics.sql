@@ -108,11 +108,11 @@ ALTER TABLE topic.topic_groups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE topic.topic_group_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE topic.topic_offsets ENABLE ROW LEVEL SECURITY;
 CREATE POLICY owner_reads ON topic.topic_groups FOR SELECT
-    USING (pg_catalog.pg_has_role(current_user, owner_role, 'member'));
+    USING (coalesce(pg_catalog.pg_has_role(current_user, pg_catalog.to_regrole(pg_catalog.quote_ident(owner_role)), 'USAGE'), false));
 CREATE POLICY owner_reads ON topic.topic_group_members FOR SELECT
-    USING (pg_catalog.pg_has_role(current_user, owner_role, 'member'));
+    USING (coalesce(pg_catalog.pg_has_role(current_user, pg_catalog.to_regrole(pg_catalog.quote_ident(owner_role)), 'USAGE'), false));
 CREATE POLICY owner_reads ON topic.topic_offsets FOR SELECT
-    USING (pg_catalog.pg_has_role(current_user, owner_role, 'member'));
+    USING (coalesce(pg_catalog.pg_has_role(current_user, pg_catalog.to_regrole(pg_catalog.quote_ident(owner_role)), 'USAGE'), false));
 
 CREATE FUNCTION topic.band_count(schema_name text, topic text) RETURNS smallint
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
@@ -390,7 +390,7 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'topic: % is not an ordinary table', base;
     END IF;
-    IF NOT pg_has_role(who, base_owner, 'member') THEN
+    IF NOT pg_has_role(who, base_owner, 'USAGE') THEN
         RAISE EXCEPTION 'topic: role % is not a member of %, the owner of %', who, base_owner, base
             USING ERRCODE = '42501';
     END IF;
@@ -439,7 +439,7 @@ BEGIN
     END IF;
     SELECT r.rolname INTO queue_owner FROM pg_class k JOIN pg_roles r ON r.oid = k.relowner
     WHERE k.oid = format('%I.%I', s, t)::regclass;
-    IF NOT pg_has_role(who, queue_owner, 'member') THEN
+    IF NOT pg_has_role(who, queue_owner, 'USAGE') THEN
         RAISE EXCEPTION 'topic.attach: role % is not a member of %, the owner of %.%', who, queue_owner, s, t
             USING ERRCODE = '42501';
     END IF;
@@ -521,7 +521,7 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'topic: topic % does not exist', owned_topic.topic USING ERRCODE = '42P01';
     END IF;
-    IF NOT pg_has_role(who, owner_name, 'member') THEN
+    IF NOT pg_has_role(who, owner_name, 'USAGE') THEN
         RAISE EXCEPTION 'topic: role % is not a member of %, the owner of topic %', who, owner_name, owned_topic.topic
             USING ERRCODE = '42501';
     END IF;
@@ -612,6 +612,37 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION topic.grant_publish(topic text, role name) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    q record;
+BEGIN
+    SELECT * INTO q FROM topic.owned_topic(grant_publish.topic);
+    IF role = 'public' THEN
+        RAISE EXCEPTION 'topic.grant_publish: the role name public means every role, so grant_publish refuses it'
+            USING ERRCODE = '22023', HINT = 'To give it to every role on purpose, run GRANT INSERT (band, key, value, headers, producer_timestamp) ON the queue table TO PUBLIC.';
+    END IF;
+    EXECUTE format('GRANT INSERT (band, key, value, headers, producer_timestamp) ON %I.%I TO %I',
+        q.schema_name, q.topic_name, role);
+END
+$$;
+
+CREATE FUNCTION topic.grant_consume(topic text, role name) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    q record;
+BEGIN
+    SELECT * INTO q FROM topic.owned_topic(grant_consume.topic);
+    IF role = 'public' THEN
+        RAISE EXCEPTION 'topic.grant_consume: the role name public means every role, so grant_consume refuses it'
+            USING ERRCODE = '22023', HINT = 'To give it to every role on purpose, run GRANT SELECT ON the queue table TO PUBLIC.';
+    END IF;
+    EXECUTE format('GRANT SELECT ON %I.%I TO %I', q.schema_name, q.topic_name, role);
+END
+$$;
+
 CREATE FUNCTION topic.band_offsets(topic text) RETURNS TABLE (band smallint, oldest_offset bigint, next_offset bigint)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
@@ -675,7 +706,7 @@ BEGIN
     -- A retry on a new connection waits here until its first attempt commits or aborts, and then sees its ring row.
     SELECT i.owner_role, i.last_used_at INTO owner, used
     FROM topic.producer_ids i WHERE i.producer_id = produce_check.producer_id FOR UPDATE;
-    IF NOT coalesce(pg_has_role(topic.caller(), to_regrole(quote_ident(owner)), 'member'), false) THEN
+    IF NOT coalesce(pg_has_role(topic.caller(), to_regrole(quote_ident(owner)), 'USAGE'), false) THEN
         RAISE EXCEPTION 'topic.produce_check: producer % is not known to role %', produce_check.producer_id, topic.caller()
             USING ERRCODE = 'PT004';
     END IF;
@@ -826,12 +857,16 @@ DECLARE
     all_rejoined boolean;
     longest int;
 BEGIN
-    SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = group_enter.group_name FOR UPDATE;
+    SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = group_enter.group_name;
     IF NOT FOUND THEN
         RETURN 'UNKNOWN_MEMBER_ID';
     END IF;
-    IF NOT pg_has_role(topic.caller(), g.owner_role, 'member') THEN
+    IF NOT coalesce(pg_has_role(topic.caller(), to_regrole(quote_ident(g.owner_role)), 'USAGE'), false) THEN
         RETURN 'GROUP_AUTHORIZATION_FAILED';
+    END IF;
+    PERFORM FROM topic.topic_groups t WHERE t.group_name = g.group_name FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'UNKNOWN_MEMBER_ID';
     END IF;
     PERFORM topic.expire_members(g.group_name);
     SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = g.group_name;
@@ -1171,7 +1206,7 @@ DECLARE
     group_owner name;
 BEGIN
     SELECT g.owner_role INTO group_owner FROM topic.topic_groups g WHERE g.group_name = fetch_offset.group_name;
-    IF NOT pg_has_role(topic.caller(), group_owner, 'member')
+    IF NOT coalesce(pg_has_role(topic.caller(), to_regrole(quote_ident(group_owner)), 'USAGE'), group_owner IS NULL)
        OR queue IS NULL
        OR NOT EXISTS (SELECT FROM topic.topic_config c WHERE c.schema_name = s AND c.topic = t)
        OR NOT has_table_privilege(topic.caller(), queue, 'SELECT') THEN
@@ -1293,7 +1328,7 @@ DECLARE
     g topic.topic_groups;
 BEGIN
     SELECT * INTO g FROM topic.topic_groups t WHERE t.group_name = describe_group.group_name;
-    IF NOT FOUND OR NOT pg_has_role(topic.caller(), g.owner_role, 'member') THEN
+    IF NOT FOUND OR NOT coalesce(pg_has_role(topic.caller(), to_regrole(quote_ident(g.owner_role)), 'USAGE'), false) THEN
         RETURN QUERY SELECT false, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::bytea, NULL::bytea;
         RETURN;
     END IF;

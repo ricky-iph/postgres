@@ -94,13 +94,6 @@ fifo_session() {
   "$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d postgres -q -f "$WORK/$1.fifo" >"$WORK/$1.out" 2>&1 &
 }
 
-fifo_session lock
-exec 5>"$WORK/lock.fifo"
-for t in tenant_a.probe_q tenant_a.late_q public.odd_q; do
-  echo "SELECT pg_advisory_lock($STAMP_LOCK_NS, hashtext('$t'));" >&5
-done
-wait_for "[ \"\$(psql_as postgres \"SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted\")\" = 3 ]"
-
 "$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d postgres -q -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
 BEGIN;
 $(topic_sql public.ret_q 2)
@@ -181,6 +174,12 @@ CREATE TRIGGER probe BEFORE INSERT OR UPDATE ON tenant_a.late_q FOR EACH ROW EXE
 $(old_partitions tenant_a.late_q 3)
 INSERT INTO tenant_a.late_q (band, value, published_at) VALUES (0, '{}', $(at 3));
 $(hide tenant_a "$(part tenant_a.late_q 3)")
+RESET ROLE;
+CREATE FUNCTION public.hold() RETURNS trigger LANGUAGE plpgsql AS \$\$
+BEGIN RAISE EXCEPTION 'the harness holds the stamper off'; END \$\$;
+CREATE TRIGGER a_hold BEFORE UPDATE ON tenant_a.probe_q FOR EACH ROW EXECUTE FUNCTION public.hold();
+CREATE TRIGGER a_hold BEFORE UPDATE ON tenant_a.late_q FOR EACH ROW EXECUTE FUNCTION public.hold();
+CREATE TRIGGER a_hold BEFORE UPDATE ON public.odd_q FOR EACH ROW EXECUTE FUNCTION public.hold();
 COMMIT;
 SQL
 chk "the setup commits" 11 "$(psql_as postgres "SELECT count(*) FROM topic.topic_config")"

@@ -986,6 +986,177 @@ mod tests {
     }
 
     #[pg_test]
+    fn grant_publish_and_grant_consume_are_owner_fenced() {
+        tenant("pgt_gr_owner");
+        Spi::run(
+            "CREATE ROLE pgt_gr_member IN ROLE pgt_gr_owner; CREATE ROLE pgt_gr_other;
+             CREATE ROLE pgt_gr_pub; CREATE ROLE pgt_gr_con;
+             SET LOCAL ROLE pgt_gr_owner;
+             SELECT topic.create_topic('pgt_gr_owner.g_q', 1);
+             RESET ROLE",
+        )
+        .unwrap();
+        let grants = || {
+            one::<String>(
+                "SELECT concat_ws('/',
+                     (SELECT string_agg(attname, ',' ORDER BY attname) FROM pg_attribute
+                      WHERE attrelid = 'pgt_gr_owner.g_q'::regclass AND attnum > 0 AND NOT attisdropped
+                        AND has_column_privilege('pgt_gr_pub', attrelid, attnum, 'INSERT')),
+                     has_table_privilege('pgt_gr_pub', 'pgt_gr_owner.g_q', 'SELECT'),
+                     has_table_privilege('pgt_gr_con', 'pgt_gr_owner.g_q', 'SELECT'),
+                     has_any_column_privilege('pgt_gr_con', 'pgt_gr_owner.g_q', 'INSERT'))",
+            )
+        };
+        let run_as = |role: &str| {
+            Spi::run(&format!("SET LOCAL ROLE {role}")).unwrap();
+            let states = [
+                state_of("SELECT topic.grant_publish('pgt_gr_owner.g_q', 'pgt_gr_pub')"),
+                state_of("SELECT topic.grant_consume('pgt_gr_owner.g_q', 'pgt_gr_con')"),
+            ];
+            Spi::run("RESET ROLE").unwrap();
+            states
+        };
+        assert_eq!(
+            run_as("pgt_gr_other"),
+            [Some("42501".to_string()), Some("42501".to_string())]
+        );
+        assert_eq!(grants(), Some("f/f/f".into()));
+        assert_eq!(run_as("pgt_gr_member"), [None, None]);
+        assert_eq!(
+            grants(),
+            Some("band,headers,key,producer_timestamp,value/f/t/f".into())
+        );
+        Spi::run("SET LOCAL ROLE pgt_gr_owner").unwrap();
+        let to_public = [
+            state_of("SELECT topic.grant_publish('pgt_gr_owner.g_q', 'public')"),
+            state_of("SELECT topic.grant_consume('pgt_gr_owner.g_q', 'public')"),
+        ];
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(
+            to_public,
+            [Some("22023".to_string()), Some("22023".to_string())]
+        );
+        assert_eq!(
+            one::<String>(
+                "SELECT has_any_column_privilege('public', 'pgt_gr_owner.g_q', 'INSERT') || '/'
+                     || has_table_privilege('public', 'pgt_gr_owner.g_q', 'SELECT')"
+            ),
+            Some("false/false".into())
+        );
+    }
+
+    #[pg_test]
+    fn fences_refuse_a_member_without_inherit() {
+        tenant("pgt_ni_owner");
+        Spi::run(
+            "CREATE ROLE pgt_ni_member; GRANT pgt_ni_owner TO pgt_ni_member WITH INHERIT FALSE;
+             SET LOCAL ROLE pgt_ni_owner;
+             SELECT topic.create_topic('pgt_ni_owner.n_q', 1);
+             SELECT topic.commit_offset('pgt_ni_owner.n_q', 'pgt_ni_g', 0, 0, -1);
+             RESET ROLE",
+        )
+        .unwrap();
+        Spi::run("SET LOCAL ROLE pgt_ni_member").unwrap();
+        let seen = (
+            state_of("SELECT topic.set_retention('pgt_ni_owner.n_q', '1 day')"),
+            state_of("SELECT topic.grant_consume('pgt_ni_owner.n_q', 'pgt_ni_member')"),
+            one::<String>("SELECT topic.group_heartbeat('pgt_ni_g', 'm', 0)"),
+            one::<i64>("SELECT count(*) FROM topic.topic_offsets"),
+        );
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(
+            seen,
+            (
+                Some("42501".into()),
+                Some("42501".into()),
+                Some("GROUP_AUTHORIZATION_FAILED".into()),
+                Some(0)
+            )
+        );
+    }
+
+    #[pg_test]
+    fn group_policy_survives_a_dropped_owner() {
+        tenant("pgt_gone");
+        tenant("pgt_kept");
+        let join = |group: &str| {
+            format!(
+                r#"SELECT (topic.group_join('{group}', m.member_id, 'c', 1800000, 5000, 'consumer', '[{{"name": "range"}}]')).error
+                   FROM topic.group_join('{group}', '', 'c', 1800000, 5000, 'consumer', '[{{"name": "range"}}]') m"#
+            )
+        };
+        Spi::run(&format!(
+            "SET LOCAL ROLE pgt_kept;
+             SELECT topic.create_topic('pgt_kept.k_q', 1);
+             GRANT SELECT ON pgt_kept.k_q TO pgt_gone;
+             SELECT topic.commit_offset('pgt_kept.k_q', 'pgt_kept_g', 0, 0, -1);
+             {};
+             SET LOCAL ROLE pgt_gone;
+             SELECT topic.commit_offset('pgt_kept.k_q', 'pgt_gone_g', 0, 0, -1);
+             {};
+             RESET ROLE;
+             DROP OWNED BY pgt_gone; DROP ROLE pgt_gone",
+            join("pgt_kept_j"),
+            join("pgt_gone_j")
+        ))
+        .unwrap();
+        assert_eq!(
+            one::<i64>(
+                "SELECT (SELECT count(*) FROM topic.topic_groups WHERE owner_role = 'pgt_gone')
+                      + (SELECT count(*) FROM topic.topic_group_members WHERE owner_role = 'pgt_gone')
+                      + (SELECT count(*) FROM topic.topic_offsets WHERE owner_role = 'pgt_gone')"
+            ),
+            Some(4)
+        );
+        Spi::run("SET LOCAL ROLE pgt_kept").unwrap();
+        let seen = error_of(
+            "SELECT 1 FROM topic.topic_groups, topic.topic_group_members, topic.topic_offsets",
+        )
+        .or_else(|| {
+            one::<String>(
+                "SELECT concat_ws('|', (SELECT string_agg(group_name, ',' ORDER BY group_name) FROM topic.topic_groups),
+                                       (SELECT string_agg(group_name, ',') FROM topic.topic_group_members),
+                                       (SELECT string_agg(group_name, ',') FROM topic.topic_offsets))",
+            )
+        });
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(
+            seen,
+            Some("pgt_kept_g,pgt_kept_j|pgt_kept_j|pgt_kept_g".into())
+        );
+    }
+
+    #[pg_test]
+    fn offsets_policy_hides_other_tenants() {
+        for t in ["pgt_pol_a", "pgt_pol_b"] {
+            tenant(t);
+            Spi::run(&format!(
+                "SET LOCAL ROLE {t};
+                 SELECT topic.create_topic('{t}.o_q', 1);
+                 SELECT topic.commit_offset('{t}.o_q', '{t}_g', 0, 0, -1);
+                 RESET ROLE"
+            ))
+            .unwrap();
+        }
+        let seen = |role: &str| {
+            Spi::run(&format!("SET LOCAL ROLE {role}")).unwrap();
+            let groups = one::<Vec<String>>(
+                "SELECT coalesce(array_agg(group_name ORDER BY group_name), '{}') FROM topic.topic_offsets",
+            );
+            Spi::run("RESET ROLE").unwrap();
+            groups
+        };
+        assert_eq!(
+            one::<i64>(
+                "SELECT count(*) FROM topic.topic_offsets WHERE group_name LIKE 'pgt_pol_%'"
+            ),
+            Some(2)
+        );
+        assert_eq!(seen("pgt_pol_a"), Some(vec!["pgt_pol_a_g".to_string()]));
+        assert_eq!(seen("pgt_pol_b"), Some(vec!["pgt_pol_b_g".to_string()]));
+    }
+
+    #[pg_test]
     fn drop_topic_removes_table_partitions_and_control_rows() {
         Spi::run(
             "SELECT topic.create_topic('public.dropped_q', 2);

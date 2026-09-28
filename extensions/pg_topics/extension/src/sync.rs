@@ -6,7 +6,6 @@ use pgrx::spi::{self, quote_identifier, quote_literal, quote_qualified_identifie
 
 use crate::{as_owner, caller, queue_owner, read_one, text_arg};
 
-const SYNC_LOCK: i32 = 0x7067_7379;
 const SAVEPOINTS: usize = 50;
 
 struct Target {
@@ -147,18 +146,13 @@ fn savepoint<R>(f: impl FnOnce() -> spi::Result<R>) -> Result<R, String> {
 }
 
 fn lock(schema_name: &str, topic: &str, wait: bool) -> spi::Result<bool> {
-    let sql = if wait {
-        "SELECT true FROM pg_catalog.pg_advisory_xact_lock($3, pg_catalog.hashtext($1 || '.' || $2))"
-    } else {
-        "SELECT pg_catalog.pg_try_advisory_xact_lock($3, pg_catalog.hashtext($1 || '.' || $2))"
-    };
-    Ok(read_one::<bool>(
-        sql,
-        vec![
-            text_arg(schema_name),
-            text_arg(topic),
-            (PgBuiltInOids::INT4OID.oid(), SYNC_LOCK.into_datum()),
-        ],
+    let sql = format!(
+        "SELECT EXISTS (SELECT FROM topic.topic_groups WHERE group_name = $1 FOR NO KEY UPDATE{})",
+        if wait { "" } else { " SKIP LOCKED" }
+    );
+    Ok(Spi::get_one_with_args::<bool>(
+        &sql,
+        vec![text_arg(&format!("__pg_topics_sync:{schema_name}.{topic}"))],
     )? == Some(true))
 }
 
@@ -167,7 +161,7 @@ fn lock(schema_name: &str, topic: &str, wait: bool) -> spi::Result<bool> {
 fn sync_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 1000)) -> spi::Result<i32> {
     let reader = queue_owner("topic.sync_topic", schema_name, topic)?;
     let target = sync_target("topic.sync_topic", schema_name, topic)?;
-    if !target.enabled || !lock(schema_name, topic, false)? {
+    if !target.enabled {
         return Ok(0);
     }
     let errors_owner = target.errors_owner;
@@ -187,8 +181,9 @@ fn sync_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 1000)) -> 
     };
     let group = format!("__pg_topics_sync:{schema_name}.{topic}");
     let names = || vec![text_arg(schema_name), text_arg(topic), text_arg(&group)];
-    let (bands, positions, ahead) = Spi::connect(|client| {
-        client
+    let read_positions = || {
+        Spi::connect(|client| {
+            client
             .select(
                 "SELECT array_agg(o.band ORDER BY o.band), array_agg(o.committed_offset ORDER BY o.band),
                         coalesce(bool_or(o.committed_offset < p.next_offset), false)
@@ -200,7 +195,12 @@ fn sync_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 1000)) -> 
             )?
             .first()
             .get_three::<Vec<i16>, Vec<i64>, bool>()
-    })?;
+        })
+    };
+    if read_positions()?.2 != Some(true) || !lock(schema_name, topic, false)? {
+        return Ok(0);
+    }
+    let (bands, positions, ahead) = read_positions()?;
     if ahead != Some(true) {
         return Ok(0);
     }
@@ -303,7 +303,7 @@ fn retry_errors(
     if read_one::<bool>(
         "SELECT EXISTS (SELECT FROM topic.topic_config t JOIN pg_catalog.pg_class c ON c.oid = t.sync_table
                         WHERE t.schema_name = $2 AND t.topic = $3
-                          AND pg_catalog.pg_has_role($1::name, c.relowner, 'member'))",
+                          AND pg_catalog.pg_has_role($1::name, c.relowner, 'USAGE'))",
         vec![text_arg(&who), text_arg(schema_name), text_arg(topic)],
     )? != Some(true)
     {
@@ -777,6 +777,36 @@ mod tests {
         assert_eq!(
             one::<String>("SELECT pg_get_userbyid(relowner)::text FROM pg_class WHERE oid = 'pgt_base.bottles_qe'::regclass"),
             Some("pgt_base".into())
+        );
+    }
+
+    #[pg_test]
+    fn tenant_trigger_cannot_reset_role_during_sync() {
+        tenant("pgt_sync_esc");
+        Spi::run("SET LOCAL ROLE pgt_sync_esc").unwrap();
+        Spi::run(
+            r#"SELECT topic.create_table_topic('pgt_sync_esc.kegs', '{"keg_id": "int"}', 'keg_id', 1);
+               CREATE FUNCTION pgt_sync_esc.escape() RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN RESET ROLE; RETURN NEW; END $$;
+               CREATE TRIGGER escape BEFORE INSERT ON pgt_sync_esc.kegs
+                   FOR EACH ROW EXECUTE FUNCTION pgt_sync_esc.escape();
+               SELECT topic.publish('pgt_sync_esc.kegs_q', '{"keg_id": 1}');"#,
+        )
+        .unwrap();
+        Spi::run("RESET ROLE").unwrap();
+        Spi::run("SELECT topic.stamp_topic('pgt_sync_esc', 'kegs_q')").unwrap();
+        let escaped = error_of("SELECT topic.sync_topic('pgt_sync_esc', 'kegs_q')");
+        assert!(
+            escaped
+                .as_deref()
+                .is_some_and(|e| e.contains("cannot set parameter \"role\"")),
+            "{escaped:?}"
+        );
+        assert_eq!(
+            one::<String>(
+                "SELECT (SELECT count(*) FROM pgt_sync_esc.kegs) || '/' || (SELECT count(*) FROM pgt_sync_esc.kegs_qe)"
+            ),
+            Some("0/0".into())
         );
     }
 
