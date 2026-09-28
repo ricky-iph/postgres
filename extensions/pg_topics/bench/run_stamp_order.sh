@@ -38,7 +38,6 @@ chk "create_topic refuses a database that pg_topics.databases does not name" yes
 chk "create_topic left no topic behind" 0 \
   "$(psql_as postgres "SELECT count(*) FROM topic.topic_config WHERE topic = 'orders_q'")"
 
-# An empty pg_topics.databases keeps every worker off, so the rest of this file stamps by hand.
 sed -i "s/pg_topics.databases = 'some_other_db'/pg_topics.databases = ''/" "$PGDATA/postgresql.conf"
 stop_pg >/dev/null
 start_pg >/dev/null
