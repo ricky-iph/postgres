@@ -237,6 +237,7 @@ def member(topic, group, name, cfg=""):
         m = c.poll(0.2)
         if m is not None and not m.error():
             read += 1
+            print("msg", m.partition(), m.offset(), flush=True)
         now = ",".join(str(p.partition) for p in sorted(c.assignment(), key=lambda p: p.partition))
         if now != last:
             print("assigned", now or "-", flush=True)

@@ -91,7 +91,7 @@ Two gaps, both small:
 Fix for both: one core function `finish_fetch_batch(&mut [u8])`. It sets attribute bit 3, writes base sequence `-1` at byte 53, and recomputes the CRC32C over bytes 21 to the end. It has one unit test that decodes the result and checks `TimestampType::LogAppend` and the CRC. Add `crc32c` as a direct dependency (it is already in the tree).
 
 Advertised versions: cap every API below the first version that uses topic IDs, because pg_topics has no topic IDs.
-Start table (in `core/src/versions.rs`): ApiVersions 0-3, SaslHandshake 0-1, SaslAuthenticate 0-2, Metadata 0-12, Produce 3-9, Fetch 4-12, ListOffsets 1-7, FindCoordinator 0-4, JoinGroup 0-9, SyncGroup 0-5, Heartbeat 0-4, LeaveGroup 0-5, OffsetCommit 2-8, OffsetFetch 1-8, InitProducerId 0-4, CreateTopics 2-7, DeleteTopics 1-5, DescribeConfigs 1-4, AlterConfigs 0-2, DeleteGroups 0-2, DescribeCluster 0-1, ListGroups 0-4, DescribeGroups 0-5.
+Start table (in `core/src/versions.rs`): ApiVersions 0-3, SaslHandshake 1-1, SaslAuthenticate 0-2, Metadata 0-12, Produce 3-9, Fetch 4-12, ListOffsets 1-7, FindCoordinator 0-4, JoinGroup 0-9, SyncGroup 0-5, Heartbeat 0-4, LeaveGroup 0-5, OffsetCommit 2-8, OffsetFetch 1-8, InitProducerId 0-4, CreateTopics 2-7, DeleteTopics 1-5, DescribeConfigs 1-4, AlterConfigs 0-2, IncrementalAlterConfigs 0-1, DeleteGroups 0-2, DescribeCluster 0-1, ListGroups 0-4, DescribeGroups 0-5.
 The client matrix in Phases 6 and 13 can lower a ceiling. It cannot raise one above the crate range.
 
 ### 3.2 How the listener runs SQL as the client's role

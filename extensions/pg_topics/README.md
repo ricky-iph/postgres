@@ -186,7 +186,8 @@ Confluent JS client read it directly (`ssl.ca.location=...`).
 Warning: set librdkafka's `partitioner` to `murmur2_random`. Its default
 partitioner does not agree with the one `pg_topics` uses for a keyed SQL
 `publish`, so a key would land in a different band depending on which side
-published it. Java's default partitioner already agrees.
+published it. The default partitioners of Java, kafkajs 2.x and franz-go
+already agree.
 
 An idempotent producer (`enable.idempotence=true`, the Java client's default
 since version 3.0) works: a retried batch does not write a second row. Kafka
@@ -225,9 +226,10 @@ from whatever already scrapes Postgres; it needs no separate exporter.
 ## Known limits
 
 - `Produce` always answers `base_offset = -1`. The real offset is not known
-  until the stamper runs, after the commit. A stock client still works; a
-  Java client counts up from `-1` for the rest of one batch, and those later
-  numbers are not real offsets.
+  until the stamper runs, after the commit. A stock client still works. Java
+  reports `-1` for each record. librdkafka reports `-1` for the first record
+  of a batch and then counts up from there, and those later numbers are not
+  real offsets.
 - `Fetch` returns the record value re-serialised from `jsonb`. Field order and
   whitespace can change. A consumer that checks a signature over the raw
   bytes it sent will not match.
