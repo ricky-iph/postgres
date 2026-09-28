@@ -257,6 +257,66 @@ backends, and enough of them use all of `pg_topics.max_clients`. Monitor
 `topic.syncrep_waiters`. Read "The replicated tier" in
 `docs/plans/2026-09-27-pg-topics-design.md` before you use this tier.
 
+## Performance
+
+These numbers come from `bench/run_benchmark.sh`, with `BENCH_SECONDS=120`, on
+one machine: an AMD Ryzen 9 5900X (12 cores, 24 threads), 31 GiB RAM,
+Windows WSL2, PostgreSQL 17.11, and a release build of `pg_topics`.
+The Kafka clients are the Java tools from `confluentinc/cp-kafka:7.7.1`, and
+they run in Docker Desktop. Each record is about 200 bytes of JSON. The
+producer is idempotent and uses `acks=all`. The latency is the time from send
+to acknowledgement, as `kafka-producer-perf-test` reports it.
+
+Warning: every node runs on this one host, so replication adds no network
+latency. Docker Desktop adds one network hop through Windows to each request.
+Measure on your own hardware before you size a deployment.
+
+### One node
+
+| Test | Rate | p50 | p99 | p99.9 |
+|---|---:|---:|---:|---:|
+| Produce at a fixed 10,000 records/s, 4 bands | 9,997/s | 22 ms | 51 ms | 198 ms |
+| Produce at a fixed 10,000 records/s, 12 bands | 9,997/s | 23 ms | 42 ms | 168 ms |
+| Consume the same records, one group | 53,000/s | | | |
+| Produce to consume, end to end (10 samples) | | 22 ms | 57 ms | |
+| Top speed, 1 producer | 31,000/s | 2.9 s | 4.7 s | |
+| Top speed, 4 producers | 61,000/s | | 2.3 s | |
+
+The stamper gave each record its offset within 0.28 s at 10,000 records/s.
+At top speed the producers queue, so the latency is in seconds. For low
+latency, keep a node at about 10,000 records/s.
+
+### Three nodes, one cluster
+
+A primary and two synchronous streaming standbys. The topic uses the
+`replicated` tier, so a Kafka client sees replication factor 3.
+
+| `synchronous_standby_names` | Copies at ack | Rate | p50 | p99 | p99.9 |
+|---|---|---:|---:|---:|---:|
+| `FIRST 2 (s1, s2)` | 3 of 3 | 9,994/s | 51 ms | 142 ms | 265 ms |
+| `ANY 1 (s1, s2)` | 2 of 3 | 9,996/s | 47 ms | 109 ms | 219 ms |
+
+Consumers read at about 53,000 to 58,000 records/s from the primary in both
+setups.
+
+### SQL publish
+
+One `topic.publish` in each transaction, from `pgbench`. Each transaction
+waits for its own commit, so this is much slower than a Kafka producer, which
+sends records in batches.
+
+| Setup | 1 client | 4 clients | 8 clients |
+|---|---:|---:|---:|
+| One node, `durable` | 515/s | 1,193/s | 2,264/s |
+| Three nodes, 3 of 3 copies | 181/s | 361/s | 670/s |
+| Three nodes, 2 of 3 copies | 183/s | 363/s | 669/s |
+
+To run the suite yourself:
+
+```bash
+BENCH_SECONDS=120 bash bench/run_benchmark.sh
+```
+
 ## Monitoring
 
 Every view below lives in schema `topic`. `SELECT` on each one, and `EXECUTE`

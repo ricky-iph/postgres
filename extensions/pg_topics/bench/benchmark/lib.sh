@@ -28,8 +28,9 @@ percentile() {
 e2e_latency_samples() {
   local topic=$1 count=$2 i out
   for i in $(seq 1 "$count"); do
-    out=$(kafka_py alice alice-pw latency "$topic")
-    sed -n 's/^latency \([0-9]*\)$/\1/p' <<<"$out"
+    if out=$(kafka_py alice alice-pw latency "$topic" 2>&1); then
+      sed -n 's/^latency \([0-9]*\)$/\1/p' <<<"$out"
+    fi
   done
 }
 
@@ -38,7 +39,14 @@ band_spread_ok() {
     SELECT bool_and(abs(n - avg_n) <= avg_n * 0.05) FROM c, (SELECT avg(n) AS avg_n FROM c) a"
 }
 
+install_release_build() {
+  stop_pg
+  (cd "$HERE/../extension" && cargo pgrx install --release --pg-config "$PG_CONFIG" >/dev/null)
+  start_pg >/dev/null
+}
+
 machine_facts() {
+  local build_profile=$1
   echo "CPU: $(sed -n 's/^model name\s*: //p' /proc/cpuinfo | head -1)"
   echo "cores: $(nproc)"
   echo "RAM: $(free -h | awk '/^Mem:/ {print $2}')"
@@ -48,4 +56,5 @@ machine_facts() {
   echo "kernel: $(uname -r)"
   echo "PostgreSQL: $("$PG_CONFIG" --version)"
   echo "pg_topics commit: $(git -C "$HERE" rev-parse HEAD)"
+  echo "pg_topics build profile: $build_profile"
 }
