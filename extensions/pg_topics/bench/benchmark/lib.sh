@@ -3,8 +3,8 @@ write_payload_json() {
 }
 
 kafka_reachable() {
-  timeout 15 docker run --rm --network host -v "$WORK:/w:ro" confluentinc/cp-kafka:7.7.1 \
-    kafka-broker-api-versions --bootstrap-server "127.0.0.1:$KPORT" --command-config /w/alice.properties >/dev/null 2>&1
+  timeout 15 docker run --rm "${DOCKER_NET_ARGS[@]}" -v "$WORK:/w:ro" confluentinc/cp-kafka:7.7.1 \
+    kafka-broker-api-versions --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --command-config /w/alice.properties >/dev/null 2>&1
 }
 
 producer_rate()  { sed -n 's/^[0-9]* records sent, \([0-9.]*\) records\/sec.*/\1/p' <<<"$1"; }

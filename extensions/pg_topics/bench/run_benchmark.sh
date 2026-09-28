@@ -22,7 +22,7 @@ produce_consume_round() {
   local produced
   produced=$(kafka_java kafka-producer-perf-test --topic "$topic" --num-records "$records" --throughput "$rate" \
     --payload-file /w/payload.json --producer.config /w/alice.properties \
-    --producer-props "bootstrap.servers=127.0.0.1:$KPORT" acks=all | grep 'records sent' | tail -n 1)
+    --producer-props "bootstrap.servers=$BOOTSTRAP_HOST:$KPORT" acks=all | grep 'records sent' | tail -n 1)
   kill "$sampler"
   wait "$sampler" 2>/dev/null || true
   local max_backlog p99_backlog
@@ -31,7 +31,7 @@ produce_consume_round() {
   echo "$label produce: $produced"
   echo "$label max backlog_age ${max_backlog}s, p99 backlog_age ${p99_backlog}s"
 
-  kafka_java kafka-consumer-perf-test --bootstrap-server "127.0.0.1:$KPORT" --topic "$topic" --group "consume_$short" \
+  kafka_java kafka-consumer-perf-test --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic "$topic" --group "consume_$short" \
     --messages "$records" --timeout 60000 --consumer.config /w/alice.properties >"$WORK/consume_$short.out"
   local consumed
   consumed=$(consumer_row "$(cat "$WORK/consume_$short.out")")
@@ -72,7 +72,7 @@ if [ "$reachable" = t ]; then
   psql_as alice "SELECT topic.create_topic('$topic2', 4)" >/dev/null
   produced=$(kafka_java kafka-producer-perf-test --topic "$topic2" --num-records "$max_records" --throughput -1 \
     --payload-file /w/payload.json --producer.config /w/alice.properties \
-    --producer-props "bootstrap.servers=127.0.0.1:$KPORT" acks=all | grep 'records sent' | tail -n 1)
+    --producer-props "bootstrap.servers=$BOOTSTRAP_HOST:$KPORT" acks=all | grep 'records sent' | tail -n 1)
   echo "max throughput, 1 producer: $produced"
   row "| max throughput, 1 producer | 4 | 1 | -1 | $(producer_rate "$produced") | $(producer_p50 "$produced") | $(producer_p99 "$produced") | $(producer_p999 "$produced") | - | - |"
 
@@ -83,7 +83,7 @@ if [ "$reachable" = t ]; then
   for n in 1 2 3 4; do
     kafka_java kafka-producer-perf-test --topic "$topic2b" --num-records "$per_producer" --throughput -1 \
       --payload-file /w/payload.json --producer.config /w/alice.properties \
-      --producer-props "bootstrap.servers=127.0.0.1:$KPORT" acks=all >"$WORK/max4_$n.out" 2>&1 &
+      --producer-props "bootstrap.servers=$BOOTSTRAP_HOST:$KPORT" acks=all >"$WORK/max4_$n.out" 2>&1 &
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do wait "$pid"; done
@@ -135,7 +135,7 @@ stop_pg
 cat >>"$D1/postgresql.conf" <<CONF
 pg_topics.tls_cert_file = '$WORK/server.crt'
 pg_topics.tls_key_file = '$WORK/server.key'
-pg_topics.advertised_host = '127.0.0.1'
+pg_topics.advertised_host = '$BOOTSTRAP_HOST'
 pg_topics.port = $K1
 CONF
 start_pg

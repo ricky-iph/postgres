@@ -8,6 +8,17 @@ import time
 from confluent_kafka import Consumer, KafkaException, Producer, TopicPartition
 
 
+def connect(host, port):
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            return socket.create_connection((host, port), timeout=5)
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
 def base():
     return {
         "bootstrap.servers": os.environ["BOOTSTRAP"],
@@ -114,7 +125,7 @@ def raw(request):
     tls = ssl.create_default_context(cafile="/w/server.crt")
     data = b""
     closed = False
-    with socket.create_connection((host, int(port))) as s, tls.wrap_socket(s, server_hostname=host) as t:
+    with connect(host, int(port)) as s, tls.wrap_socket(s, server_hostname=host) as t:
         t.sendall(bytes.fromhex(request))
         t.settimeout(2)
         try:
@@ -158,7 +169,7 @@ def produce_partition(topic, partition):
 
     host, port = os.environ["BOOTSTRAP"].split(":")
     tls = ssl.create_default_context(cafile="/w/server.crt")
-    with socket.create_connection((host, int(port))) as s, tls.wrap_socket(s, server_hostname=host) as t:
+    with connect(host, int(port)) as s, tls.wrap_socket(s, server_hostname=host) as t:
         call(t, 17, 1, string("PLAIN"))
         auth = f"\0{os.environ['KAFKA_USER']}\0{os.environ['KAFKA_PASSWORD']}".encode()
         call(t, 36, 0, struct.pack(">i", len(auth)) + auth)

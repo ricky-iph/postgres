@@ -111,9 +111,9 @@ chk "Kafka: tenant_a cannot read the offsets of tenant_b's group" "committed GRO
 class() {
   grep -o 'org\.apache\.kafka\.common\.errors\.[A-Za-z]*Exception' <<<"$1" | head -n1
 }
-forbidden=$(kafka_java kafka-consumer-groups --bootstrap-server "127.0.0.1:$KPORT" --command-config /w/tenant_a.properties \
+forbidden=$(kafka_java kafka-consumer-groups --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --command-config /w/tenant_a.properties \
   --delete --group b_group || true)
-missing=$(kafka_java kafka-consumer-groups --bootstrap-server "127.0.0.1:$KPORT" --command-config /w/tenant_a.properties \
+missing=$(kafka_java kafka-consumer-groups --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --command-config /w/tenant_a.properties \
   --delete --group ghost_group || true)
 chk "Kafka (Java CLI): tenant_a cannot delete tenant_b's group" org.apache.kafka.common.errors.GroupAuthorizationException \
   "$(class "$forbidden")"

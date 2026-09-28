@@ -43,7 +43,7 @@ drop_listener_in_commit() {
 PGAPPNAME=stranger "$PGBIN/psql" -h /tmp -p "$PORT" -U stranger -d postgres -q -o /dev/null \
   -c "SELECT pg_advisory_lock(1885828208, hashint8(i)) FROM generate_series(1, 100) i" -c "SELECT pg_sleep(3600)" >/dev/null 2>&1 &
 wait_for "[ \"\$(psql_as postgres \"SELECT count(*) FROM pg_stat_activity WHERE application_name = 'stranger' AND wait_event = 'PgSleep'\")\" = 1 ]"
-out=$(kafka_java kafka-verifiable-producer --bootstrap-server "127.0.0.1:$KPORT" --topic alice.java_q \
+out=$(kafka_java kafka-verifiable-producer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic alice.java_q \
   --max-messages 10000 --producer.config /w/alice.properties)
 chk "while a stranger holds advisory locks, a Java producer with enable.idempotence=true and acks=all gets 10000 acks" \
   10000 "$(acked "$out")"
@@ -51,7 +51,7 @@ chk "the table has exactly 10000 rows, all distinct" "10000|10000" "$(rows java_
 chk "the Java producer got one producer id from InitProducerId" 1 \
   "$(psql_as postgres "SELECT count(DISTINCT producer_id) FROM topic.topic_producers WHERE topic = 'java_q'")"
 
-kafka_java kafka-verifiable-producer --bootstrap-server "127.0.0.1:$KPORT" --topic alice.java_kill_q \
+kafka_java kafka-verifiable-producer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic alice.java_kill_q \
   --max-messages 10000 --producer.config /w/alice.properties >"$WORK/java_kill.out" &
 java=$!
 drop_listener_in_commit Java
@@ -69,7 +69,7 @@ chk "librdkafka with enable.idempotence=true gets 10000 acks across the listener
 chk "the librdkafka retries wrote no duplicate" "10000|10000" "$(rows py_kill_q)"
 
 out=$( (for v in 1 2 3 notjson 4 5 6 7 8; do echo "$v"; sleep 1; done) | kafka_java kafka-console-producer \
-  --bootstrap-server "127.0.0.1:$KPORT" --topic alice.epoch_q --producer.config /w/alice.properties --producer-property linger.ms=0 || true)
+  --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic alice.epoch_q --producer.config /w/alice.properties --producer-property linger.ms=0 || true)
 chk "only the record that is not JSON fails" 1 "$(grep -c 'Error when sending message' <<<"$out" || true)"
 chk "after INVALID_RECORD the Java producer bumps its epoch, keeps working, and every acked record is in the table" \
   "1 2 3 4 5 6 7 8" "$(psql_as postgres "SELECT string_agg(value::text, ' ' ORDER BY value::text) FROM alice.epoch_q")"

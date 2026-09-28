@@ -53,7 +53,7 @@ if kafka_reachable; then
     local topic="public.kb${bands}_q"
     psql_as postgres "SELECT topic.create_topic('$topic', $bands)" >/dev/null
     psql_as postgres "SELECT topic.grant_publish('$topic', 'alice')" >/dev/null
-    kafka_uuid_lines | kafka_java kafka-console-producer --bootstrap-server "127.0.0.1:$KPORT" \
+    kafka_uuid_lines | kafka_java kafka-console-producer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" \
       --topic "$topic" --producer.config /w/alice.properties --property parse.key=true >/dev/null
     wait_for "[ \"\$(unstamped $topic)\" = 0 ]"
     chk "Kafka producer with random uuid keys spreads within 5% of the mean, $bands bands" t "$(band_spread_ok "$topic")"

@@ -43,7 +43,7 @@ stop_pg >/dev/null
 cat >>"$D1/postgresql.conf" <<CONF
 pg_topics.tls_cert_file = '$WORK/server.crt'
 pg_topics.tls_key_file = '$WORK/server.key'
-pg_topics.advertised_host = '127.0.0.1'
+pg_topics.advertised_host = '$BOOTSTRAP_HOST'
 pg_topics.port = $K1
 CONF
 start_pg >/dev/null

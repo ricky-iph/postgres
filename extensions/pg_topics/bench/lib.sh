@@ -1,6 +1,14 @@
 pass=0
 fail=0
 
+if docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -qx 'Docker Desktop'; then
+  BOOTSTRAP_HOST=host.docker.internal
+  DOCKER_NET_ARGS=()
+else
+  BOOTSTRAP_HOST=127.0.0.1
+  DOCKER_NET_ARGS=(--network host)
+fi
+
 chk() {
   if [ "$2" = "$3" ]; then
     echo "PASS  $1"
@@ -44,7 +52,7 @@ make_cert() {
   local dir=$1
   openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
     -keyout "$dir/server.key" -out "$dir/server.crt" \
-    -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 2>&1
+    -subj /CN=localhost -addext subjectAltName=DNS:localhost,DNS:host.docker.internal,IP:127.0.0.1 2>&1
 }
 
 wait_for() {
@@ -124,23 +132,35 @@ restart_listener() {
   wait_for "[ \"\$(listener_pid)\" != '$old' ] && [ \"\$(listener_status)\" = 'listening on port $KPORT' ]"
 }
 
+warm_up_docker_net() {
+  local i
+  for i in $(seq 1 50); do
+    docker run --rm pg_topics_python:2.15.1 \
+      python3 -c "import socket; socket.create_connection(('$BOOTSTRAP_HOST', $KPORT), timeout=1)" >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+}
+
 start_listener() {
   KPORT=$(free_port)
   make_cert "$WORK" >/dev/null
   docker build -q -t pg_topics_python:2.15.1 "$HERE/clients/python" >/dev/null 2>&1 || { echo "FAIL  docker build of clients/python"; exit 1; }
   psql_as postgres "ALTER SYSTEM SET pg_topics.tls_cert_file = '$WORK/server.crt'" >/dev/null
   psql_as postgres "ALTER SYSTEM SET pg_topics.tls_key_file = '$WORK/server.key'" >/dev/null
-  psql_as postgres "ALTER SYSTEM SET pg_topics.advertised_host = '127.0.0.1'" >/dev/null
+  psql_as postgres "ALTER SYSTEM SET pg_topics.advertised_host = '$BOOTSTRAP_HOST'" >/dev/null
   psql_as postgres "SELECT pg_reload_conf()" >/dev/null
   psql_as postgres "ALTER DATABASE postgres SET pg_topics.port = $KPORT" >/dev/null
   restart_listener
+  if [ ${#DOCKER_NET_ARGS[@]} -eq 0 ]; then
+    warm_up_docker_net
+  fi
 }
 
 kafka_py() {
   local user=$1 password=$2
   shift 2
-  docker run --rm ${KAFKA_NAME:+--name "$KAFKA_NAME"} --network host -v "$WORK:/w:ro" -v "$HERE/clients/python:/app:ro" \
-    -e BOOTSTRAP="127.0.0.1:$KPORT" -e KAFKA_USER="$user" -e KAFKA_PASSWORD="$password" \
+  docker run --rm ${KAFKA_NAME:+--name "$KAFKA_NAME"} "${DOCKER_NET_ARGS[@]}" -v "$WORK:/w:ro" -v "$HERE/clients/python:/app:ro" \
+    -e BOOTSTRAP="$BOOTSTRAP_HOST:$KPORT" -e KAFKA_USER="$user" -e KAFKA_PASSWORD="$password" \
     pg_topics_python:2.15.1 python /app/client.py "$@" 2>&1
 }
 
@@ -155,5 +175,5 @@ PROPS
 }
 
 kafka_java() {
-  docker run --rm -i --network host -v "$WORK:/w:ro" confluentinc/cp-kafka:7.7.1 "$@" 2>&1
+  docker run --rm -i "${DOCKER_NET_ARGS[@]}" -v "$WORK:/w:ro" confluentinc/cp-kafka:7.7.1 "$@" 2>&1
 }

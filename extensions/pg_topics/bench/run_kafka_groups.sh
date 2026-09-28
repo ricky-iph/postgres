@@ -104,7 +104,7 @@ chk "the auto-commit consumer read all 30 records" "closed read 30" "$(grep '^cl
 
 java_config alice alice-pw
 java_group() {
-  kafka_java kafka-console-consumer --bootstrap-server "127.0.0.1:$KPORT" --topic alice.java_q --group jg \
+  kafka_java kafka-console-consumer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic alice.java_q --group jg \
     --consumer.config /w/alice.properties --consumer-property max.poll.records=1 \
     --consumer-property auto.offset.reset=earliest --max-messages "$1" --timeout-ms 30000
 }

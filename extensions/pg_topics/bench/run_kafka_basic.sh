@@ -34,11 +34,11 @@ chk "before authentication, a frame above 64 KiB closes the connection at once" 
   "$(kafka_py alice alice-pw raw 000111700012000000000007000000 | grep '^raw' || true)"
 
 java_config alice alice-pw
-seq 1 100 | sed 's/.*/{"j": &}/' | kafka_java kafka-console-producer --bootstrap-server "127.0.0.1:$KPORT" \
+seq 1 100 | sed 's/.*/{"j": &}/' | kafka_java kafka-console-producer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" \
   --topic alice.java_q --producer.config /w/alice.properties --producer-property enable.idempotence=false >/dev/null
 chk "a Java producer over SASL_SSL PLAIN writes 100 records" 100 "$(psql_as postgres "SELECT count(*) FROM alice.java_q")"
 wait_for "[ \"\$(unstamped alice.java_q)\" = 0 ]"
-consumed=$(kafka_java kafka-console-consumer --bootstrap-server "127.0.0.1:$KPORT" --topic alice.java_q \
+consumed=$(kafka_java kafka-console-consumer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic alice.java_q \
   --partition 0 --offset 0 --max-messages 100 --timeout-ms 20000 \
   --consumer.config /w/alice.properties --consumer-property check.crcs=true)
 chk "a Java consumer with check.crcs=true reads the 100 records back" 100 "$(grep -c '^{"j": [0-9]*}$' <<<"$consumed" || true)"
@@ -128,7 +128,7 @@ ts=$(psql_as postgres "SELECT floor(extract(epoch FROM published_at) * 1000)::in
 chk "ListOffsets earliest, latest and by time give 5, 10 and 7" "watermarks 5 10
 time 7" "$(kafka_py alice alice-pw offsets alice.old_q 0 "$ts" | grep '^watermarks\|^time' || true)"
 chk "ListOffsets by max timestamp (-3) gives the last offset" "alice.old_q:0:9" \
-  "$(kafka_java kafka-get-offsets --bootstrap-server "127.0.0.1:$KPORT" --topic alice.old_q --time -3 --command-config /w/alice.properties | tr -d '[:space:]')"
+  "$(kafka_java kafka-get-offsets --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic alice.old_q --time -3 --command-config /w/alice.properties | tr -d '[:space:]')"
 
 kafka_py alice alice-pw produce alice.big_q 5 mid >/dev/null
 wait_for "[ \"\$(unstamped alice.big_q)\" = 0 ]"

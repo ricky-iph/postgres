@@ -20,12 +20,12 @@ while sleep 1; do
   psql_as postgres "SELECT extract(epoch FROM backlog_age) FROM topic.stamp_backlog WHERE topic = 'soak_q'" >>"$WORK/backlog"
 done &
 sampler=$!
-kafka_java kafka-consumer-perf-test --bootstrap-server "127.0.0.1:$KPORT" --topic alice.soak_q --group soak \
+kafka_java kafka-consumer-perf-test --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic alice.soak_q --group soak \
   --messages "$records" --timeout 60000 --consumer.config /w/alice.properties >"$WORK/consumer.out" &
 consumer=$!
 produced=$(kafka_java kafka-producer-perf-test --topic alice.soak_q --num-records "$records" --throughput "$rate" \
   --payload-file /w/payload.json --producer.config /w/alice.properties \
-  --producer-props "bootstrap.servers=127.0.0.1:$KPORT" acks=all | grep 'records sent' | tail -n 1)
+  --producer-props "bootstrap.servers=$BOOTSTRAP_HOST:$KPORT" acks=all | grep 'records sent' | tail -n 1)
 wait "$consumer"
 kill "$sampler"
 wait "$sampler" 2>/dev/null || true

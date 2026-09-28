@@ -16,14 +16,14 @@ done
 in_docker() {
   local name=$1
   shift
-  docker run --rm ${name:+--name "pgt_${PORT}_$name"} --network host -v "$WORK:/w:ro" \
-    -e BOOTSTRAP="127.0.0.1:$KPORT" -e KAFKA_USER=alice -e KAFKA_PASSWORD=alice-pw "$@" 2>&1
+  docker run --rm ${name:+--name "pgt_${PORT}_$name"} "${DOCKER_NET_ARGS[@]}" -v "$WORK:/w:ro" \
+    -e BOOTSTRAP="$BOOTSTRAP_HOST:$KPORT" -e KAFKA_USER=alice -e KAFKA_PASSWORD=alice-pw "$@" 2>&1
 }
 
 produce() {
   case $1 in
     java) seq 0 999 | awk '{ printf "n:%d\tk-%d\t{\"i\": %d}\n", $1, $1, $1 }' |
-      in_docker "" -i confluentinc/cp-kafka:7.7.1 kafka-console-producer --bootstrap-server "127.0.0.1:$KPORT" \
+      in_docker "" -i confluentinc/cp-kafka:7.7.1 kafka-console-producer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" \
         --topic "$2" --producer.config /w/alice.properties --property parse.key=true --property parse.headers=true ;;
     librdkafka) in_docker "" -v "$HERE/clients/python:/app:ro" pg_topics_python:2.15.1 \
       python /app/client.py produce "$2" 1000 json none k ;;
@@ -34,7 +34,7 @@ produce() {
 
 member() {
   case $1 in
-    java) in_docker "$4" confluentinc/cp-kafka:7.7.1 kafka-verifiable-consumer --bootstrap-server "127.0.0.1:$KPORT" \
+    java) in_docker "$4" confluentinc/cp-kafka:7.7.1 kafka-verifiable-consumer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" \
       --topic "$2" --group-id "$3" --consumer.config /w/alice.properties --verbose ;;
     librdkafka) in_docker "$4" -v "$HERE/clients/python:/app:ro" pg_topics_python:2.15.1 python /app/client.py \
       member "$2" "$3" "$4" enable.auto.commit=true,enable.auto.offset.store=true,auto.commit.interval.ms=500 ;;
@@ -110,7 +110,7 @@ matrix() {
     "$expected 200" "$(first_offsets "${c}_r") $(msgs "${c}_r" | wc -l)"
 
   chk "$c: a Java consumer with check.crcs=true reads every batch of the topic" 1200 \
-    "$(in_docker "" confluentinc/cp-kafka:7.7.1 kafka-console-consumer --bootstrap-server "127.0.0.1:$KPORT" \
+    "$(in_docker "" confluentinc/cp-kafka:7.7.1 kafka-console-consumer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" \
         --topic "$t" --from-beginning --max-messages 1200 --timeout-ms 30000 \
         --consumer.config /w/alice.properties --consumer-property check.crcs=true | grep -c '^{"[ir]": [0-9]*}$' || true)"
 }
