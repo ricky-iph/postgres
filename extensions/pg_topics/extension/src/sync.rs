@@ -167,14 +167,14 @@ fn sync_topic(schema_name: &str, topic: &str, max_rows: default!(i32, 1000)) -> 
     let errors_owner = target.errors_owner;
     let Some((writer, base, base_name)) = target
         .base
-        .filter(|(owner, _, _)| errors_owner.is_none_or(|e| e == *owner))
+        .filter(|(owner, _, _)| errors_owner == Some(*owner))
     else {
         Spi::run_with_args(
             "UPDATE topic.topic_config SET sync_enabled = false WHERE schema_name = $1 AND topic = $2",
             Some(vec![text_arg(schema_name), text_arg(topic)]),
         )?;
         warning!(
-            "topic.sync_topic: {schema_name}.{topic} stops syncing, because its base table or the column {} is gone, or its error table has another owner",
+            "topic.sync_topic: {schema_name}.{topic} stops syncing, because its base table or the column {} is gone, or its error table has another owner or is gone",
             target.key.unwrap_or_default()
         );
         return Ok(0);
@@ -641,6 +641,18 @@ mod tests {
     }
 
     #[pg_test]
+    fn sync_stops_when_the_error_table_is_gone() {
+        bottles();
+        publish(&format!(r#"'{{"bottle_id": "{U1}", "name": "Ardbeg"}}'"#));
+        Spi::run("DROP TABLE public.bottles_qe").unwrap();
+        assert_eq!(sync(), Some(0));
+        assert_eq!(
+            one::<bool>("SELECT sync_enabled FROM topic.topic_config WHERE topic = 'bottles_q'"),
+            Some(false)
+        );
+    }
+
+    #[pg_test]
     fn dropping_the_base_table_stops_the_sync() {
         bottles();
         publish(&format!(r#"'{{"bottle_id": "{U1}", "name": "Ardbeg"}}'"#));
@@ -912,5 +924,41 @@ mod tests {
         assert!(error_of("SELECT topic.attach('public.plain', 'id')")
             .unwrap()
             .contains("event_at timestamptz NOT NULL"));
+    }
+
+    #[pg_test]
+    fn attach_reuses_a_matching_error_table_left_by_drop_topic() {
+        Spi::run(
+            "CREATE TABLE public.kegs (keg_id int PRIMARY KEY, event_at timestamptz NOT NULL);
+             SELECT topic.attach('public.kegs', 'keg_id')",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO public.kegs_qe (band, log_offset, seq, key, value, headers, published_by,
+                                         published_at, failed_at, error)
+             VALUES (0, 0, 0, NULL, NULL, NULL, current_user, now(), now(), 'boom')",
+        )
+        .unwrap();
+        Spi::run("SELECT topic.drop_topic('public.kegs_q')").unwrap();
+        assert_eq!(
+            one::<String>("SELECT topic.attach('public.kegs', 'keg_id')"),
+            Some("public.kegs_q".into())
+        );
+        assert_eq!(one::<i64>("SELECT count(*) FROM public.kegs_qe"), Some(1));
+    }
+
+    #[pg_test]
+    fn attach_refuses_a_mismatched_error_table_left_by_drop_topic() {
+        Spi::run(
+            "CREATE TABLE public.casks2 (cask_id int PRIMARY KEY, event_at timestamptz NOT NULL);
+             SELECT topic.attach('public.casks2', 'cask_id');
+             SELECT topic.drop_topic('public.casks2_q');
+             DROP TABLE public.casks2_qe;
+             CREATE TABLE public.casks2_qe (band int)",
+        )
+        .unwrap();
+        assert!(error_of("SELECT topic.attach('public.casks2', 'cask_id')")
+            .unwrap()
+            .contains("does not match the error table"));
     }
 }

@@ -38,13 +38,17 @@ Add these lines to `postgresql.conf`, then restart PostgreSQL:
 ```ini
 shared_preload_libraries = 'pg_topics'
 pg_topics.databases = 'app'
+pg_topics.failover_is_fenced = on
 ```
 
 `pg_topics.databases` names every database that gets topics, as a comma list.
-Each named database starts four background workers: a stamper, a partition
-worker, a sync worker, and the Kafka listener. Set `max_worker_processes` to
-at least 4 times the number of named databases, plus what the rest of the
-cluster already uses.
+List only databases that exist. A missing one makes its four workers restart
+every 5 seconds. Each named database starts four background workers: a
+stamper, a partition worker, a sync worker, and the Kafka listener. Set
+`max_worker_processes` to at least 4 times the number of named databases,
+plus what the rest of the cluster already uses. `pg_topics.failover_is_fenced
+= on` tells pg_topics that the operator fences the old primary on failover.
+A topic may not ask for `durable` or `replicated` until this is `on`.
 
 Then, in each named database:
 
@@ -87,7 +91,7 @@ Or, when the cluster already has `ssl = on` with its own certificate:
 pg_topics.tls_use_postgres_cert = on
 ```
 
-With neither set, the listener does not bind. `pg_topics.health()` reports it
+With neither set, the listener does not bind. `topic.health()` reports it
 as not bound (see [Monitoring](#monitoring)).
 
 ### Every setting, with its default

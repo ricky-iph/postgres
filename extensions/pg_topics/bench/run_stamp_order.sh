@@ -27,6 +27,21 @@ EOF
 start_pg >/dev/null
 
 psql_as postgres "CREATE EXTENSION pg_topics" >/dev/null
+
+sed -i "s/pg_topics.databases = ''/pg_topics.databases = 'some_other_db'/" "$PGDATA/postgresql.conf"
+stop_pg >/dev/null
+start_pg >/dev/null
+out=$(psql_as postgres "SELECT topic.create_topic('public.orders_q', 1)" || true)
+echo "RED: create_topic when pg_topics.databases names a different database -- $out"
+chk "create_topic refuses a database that pg_topics.databases does not name" yes \
+  "$(grep -q 'is not in pg_topics.databases' <<<"$out" && echo yes || echo no)"
+chk "create_topic left no topic behind" 0 \
+  "$(psql_as postgres "SELECT count(*) FROM topic.topic_config WHERE topic = 'orders_q'")"
+
+# An empty pg_topics.databases keeps every worker off, so the rest of this file stamps by hand.
+sed -i "s/pg_topics.databases = 'some_other_db'/pg_topics.databases = ''/" "$PGDATA/postgresql.conf"
+stop_pg >/dev/null
+start_pg >/dev/null
 psql_as postgres "SELECT topic.create_topic('public.orders_q', 1)" >/dev/null
 
 stamp() {

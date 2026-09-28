@@ -352,5 +352,15 @@ chk "lint: the four workers connect as the bootstrap superuser" "4|postgres" \
   "$(psql_as postgres "SELECT count(*) || '|' || string_agg(DISTINCT usename, ',') FROM pg_stat_activity
      WHERE backend_type LIKE 'pg_topics %'")"
 
+psql_as postgres "CREATE ROLE hijacker LOGIN" >/dev/null
+psql_as postgres "CREATE DATABASE hijack_db" >/dev/null
+"$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d hijack_db -c "CREATE SCHEMA topic AUTHORIZATION hijacker" >/dev/null
+out=$("$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d hijack_db -c "CREATE EXTENSION pg_topics" 2>&1 || true)
+echo "RED: CREATE EXTENSION with schema topic pre-owned by a non-superuser -- $out"
+chk "CREATE EXTENSION refuses a topic schema that a non-superuser owns" yes \
+  "$(grep -q 'schema topic already exists' <<<"$out" && echo yes || echo no)"
+chk "the refused CREATE EXTENSION installs nothing in hijack_db" f \
+  "$("$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d hijack_db -tAc "SELECT EXISTS (SELECT FROM pg_extension WHERE extname = 'pg_topics')")"
+
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

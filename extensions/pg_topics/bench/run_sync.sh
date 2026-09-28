@@ -47,8 +47,10 @@ chk "2 idle synced topics use fewer than 20 transaction ids in 3 s" yes "$([ "$x
 
 psql_as postgres "DROP TABLE public.casks_qe;
                   SELECT topic.publish('public.casks_q', '{\"cask_id\": 1, \"n\": \"bad\"}')" >/dev/null
-chk "the sync worker logs the error of a topic" yes \
-  "$(wait_for "grep -q 'pg_topics sync worker: relation \"public.casks_qe\" does not exist. The sync worker tries again in 1 s.' '$PGDATA/log'" && echo yes || echo no)"
+chk "the sync worker stops syncing and logs a WARNING when the error table is gone" yes \
+  "$(wait_for "grep -q 'topic.sync_topic: public.casks_q stops syncing, because its base table or the column cask_id is gone, or its error table has another owner or is gone' '$PGDATA/log'" && echo yes || echo no)"
+chk "casks_q has sync_enabled turned off" f \
+  "$(psql_as postgres "SELECT sync_enabled FROM topic.topic_config WHERE topic = 'casks_q'")"
 psql_as postgres "SELECT topic.publish('public.bottles_q', '{\"bottle_id\": 1, \"n\": -1}')" >/dev/null
 chk "while one topic fails, the other topic syncs" yes \
   "$(wait_for "[ \"\$(psql_as postgres \"SELECT n FROM public.bottles WHERE bottle_id = 1\")\" = -1 ]" && echo yes || echo no)"

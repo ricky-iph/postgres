@@ -85,5 +85,35 @@ chk "error_rows counts the record that failed to sync" "public:mon_bottles_q:1:1
   "$(psql_as postgres "SELECT schema_name || ':' || topic || ':' || rows || ':' || recent
                        FROM topic.error_rows() WHERE topic = 'mon_bottles_q'")"
 
+psql_as postgres "SELECT topic.create_topic('public.mon_gone_q', 1);
+  ALTER TABLE public.mon_gone_q RENAME TO mon_gone_renamed" >/dev/null
+out=$(psql_as postgres "SELECT topic || ':' || ok FROM topic.health() WHERE topic = 'mon_gone_q'" || true)
+echo "RED: health() after renaming the queue table of public.mon_gone_q -- $out"
+chk "health() reports ok=false for a topic whose queue table was renamed away" "mon_gone_q:false" "$out"
+chk "duplicate_offsets skips a topic whose queue table was renamed away, instead of erroring" 0 \
+  "$(psql_as postgres "SELECT count(*) FROM topic.duplicate_offsets() WHERE topic = 'mon_gone_q'" || true)"
+
+psql_as postgres "SELECT topic.create_table_topic('public.mon_errtab', '{\"id\": \"int\"}', 'id');
+  DROP TABLE public.mon_errtab_qe" >/dev/null
+chk "error_rows skips a topic whose error table is gone, instead of erroring" 0 \
+  "$(psql_as postgres "SELECT count(*) FROM topic.error_rows() WHERE topic = 'mon_errtab_q'" || true)"
+
+psql_as postgres "SELECT topic.create_topic('public.mon_cross_q', 1)" >/dev/null
+psql_as postgres "CREATE DATABASE bind_fail_db" >/dev/null
+psql_as postgres "ALTER SYSTEM SET pg_topics.databases = 'postgres, bind_fail_db'" >/dev/null
+psql_as postgres "ALTER SYSTEM SET max_worker_processes = 16" >/dev/null
+psql_as postgres "ALTER DATABASE bind_fail_db SET pg_topics.port = $PORT" >/dev/null
+stop_pg >/dev/null
+start_pg >/dev/null
+"$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d bind_fail_db -c "CREATE EXTENSION pg_topics" >/dev/null
+"$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d bind_fail_db -c "SELECT topic.create_topic('public.bind_fail_q', 1)" >/dev/null
+wait_for "[ \"\$(psql_as postgres \"SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_topics listener'\")\" = 2 ]"
+out=$("$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d bind_fail_db -tAc \
+  "SELECT listener_bound || ':' || ok FROM topic.health() WHERE topic = 'bind_fail_q'")
+echo "RED: health() in bind_fail_db, whose own listener could not bind $PORT -- $out"
+chk "health() reports listener_bound=false and ok=false for a database whose own listener failed to bind" "false:false" "$out"
+chk "health() in postgres still reports its own bound listener as true, unaffected by bind_fail_db" t \
+  "$(psql_as postgres "SELECT listener_bound FROM topic.health() WHERE topic = 'mon_cross_q'")"
+
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

@@ -1,3 +1,17 @@
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT FROM pg_catalog.pg_namespace n
+        WHERE n.nspname = 'topic'
+          AND (n.nspacl IS NOT NULL
+               OR NOT EXISTS (SELECT FROM pg_catalog.pg_roles r WHERE r.oid = n.nspowner AND r.rolsuper))
+    ) THEN
+        RAISE EXCEPTION 'pg_topics: schema topic already exists. A non-superuser owns it, or a grant exists on it.'
+            USING HINT = 'Drop schema topic, or give it to a superuser with no grants. Then install pg_topics again.';
+    END IF;
+END
+$$;
+
 CREATE TABLE topic.topic_config (
     schema_name        text     NOT NULL,
     topic              text     NOT NULL,
@@ -219,6 +233,13 @@ BEGIN
         RAISE EXCEPTION 'topic.create_topic: role % has no CREATE privilege on schema %', owner_name, s
             USING ERRCODE = '42501';
     END IF;
+    IF current_setting('pg_topics.databases') <> ''
+       AND NOT EXISTS (SELECT FROM unnest(string_to_array(current_setting('pg_topics.databases'), ',')) d(name)
+                       WHERE btrim(d.name) = current_database()) THEN
+        RAISE EXCEPTION 'topic.create_topic: database % is not in pg_topics.databases. No worker ever stamps its topics.',
+            current_database()
+            USING HINT = 'Add the database to pg_topics.databases and restart PostgreSQL.';
+    END IF;
     IF min_durability IN ('durable', 'replicated') AND NOT current_setting('pg_topics.failover_is_fenced')::bool THEN
         RAISE EXCEPTION 'topic.create_topic: min_durability % needs pg_topics.failover_is_fenced = on', min_durability;
     END IF;
@@ -356,10 +377,11 @@ $$;
 CREATE FUNCTION topic.reap() RETURNS void
 LANGUAGE sql SET search_path = pg_catalog, pg_temp
 AS $$
-    DELETE FROM topic.topic_producers WHERE updated_at < now() - interval '1 day';
     DELETE FROM topic.producer_ids i
     WHERE i.last_used_at < now() - interval '7 days'
-      AND NOT EXISTS (SELECT FROM topic.topic_producers p WHERE p.producer_id = i.producer_id);
+      AND NOT EXISTS (SELECT FROM topic.topic_producers p
+                      WHERE p.producer_id = i.producer_id AND p.updated_at >= now() - interval '1 day');
+    DELETE FROM topic.topic_producers WHERE updated_at < now() - interval '1 day';
     DELETE FROM topic.topic_groups g
     WHERE g.state = 'Empty'
       AND NOT starts_with(g.group_name, '__pg_topics_sync:')
@@ -427,6 +449,10 @@ DECLARE
     base_owner name;
     queue_owner name;
     grp text;
+    errors regclass;
+    errors_kind "char";
+    errors_owner name;
+    errors_shape text[];
 BEGIN
     base_owner := topic.sync_base_owner(base, attach.sync_key);
     SELECT n.nspname, k.relname || '_q' INTO s, t
@@ -444,23 +470,46 @@ BEGIN
             USING ERRCODE = '42501';
     END IF;
 
-    EXECUTE format(
-        'CREATE TABLE %I.%I (
-            band               smallint    NOT NULL,
-            log_offset         bigint      NOT NULL,
-            seq                bigint      NOT NULL,
-            key                varchar(40),
-            value              jsonb,
-            headers            jsonb,
-            published_by       name        NOT NULL,
-            published_at       timestamptz NOT NULL,
-            producer_timestamp timestamptz,
-            failed_at          timestamptz NOT NULL DEFAULT now(),
-            error              text        NOT NULL,
-            PRIMARY KEY (band, log_offset)
-        )', s, t || 'e');
-    EXECUTE format('CREATE INDEX ON %I.%I (failed_at)', s, t || 'e');
-    EXECUTE format('ALTER TABLE %I.%I OWNER TO %I', s, t || 'e', base_owner);
+    errors := to_regclass(format('%I.%I', s, t || 'e'));
+    IF errors IS NOT NULL THEN
+        SELECT k.relkind, r.rolname INTO errors_kind, errors_owner
+        FROM pg_class k JOIN pg_roles r ON r.oid = k.relowner WHERE k.oid = errors;
+        SELECT array_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod)
+                          || CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END ORDER BY a.attnum)
+        INTO errors_shape
+        FROM pg_attribute a WHERE a.attrelid = errors AND a.attnum > 0 AND NOT a.attisdropped;
+        IF errors_kind IS DISTINCT FROM 'r' OR errors_owner IS DISTINCT FROM base_owner
+           OR errors_shape IS DISTINCT FROM ARRAY[
+               'band smallint NOT NULL', 'log_offset bigint NOT NULL', 'seq bigint NOT NULL',
+               'key character varying(40)', 'value jsonb', 'headers jsonb',
+               'published_by name NOT NULL', 'published_at timestamp with time zone NOT NULL',
+               'producer_timestamp timestamp with time zone', 'failed_at timestamp with time zone NOT NULL',
+               'error text NOT NULL']
+           OR NOT EXISTS (SELECT FROM pg_constraint k WHERE k.conrelid = errors AND k.contype = 'p'
+                          AND pg_get_constraintdef(k.oid) = 'PRIMARY KEY (band, log_offset)') THEN
+            RAISE EXCEPTION 'topic.attach: table %.% exists. Its shape or its owner does not match the error table pg_topics expects.',
+                s, t || 'e'
+                USING HINT = 'Drop it, or make its columns, primary key and owner match, then attach again.';
+        END IF;
+    ELSE
+        EXECUTE format(
+            'CREATE TABLE %I.%I (
+                band               smallint    NOT NULL,
+                log_offset         bigint      NOT NULL,
+                seq                bigint      NOT NULL,
+                key                varchar(40),
+                value              jsonb,
+                headers            jsonb,
+                published_by       name        NOT NULL,
+                published_at       timestamptz NOT NULL,
+                producer_timestamp timestamptz,
+                failed_at          timestamptz NOT NULL DEFAULT now(),
+                error              text        NOT NULL,
+                PRIMARY KEY (band, log_offset)
+            )', s, t || 'e');
+        EXECUTE format('CREATE INDEX ON %I.%I (failed_at)', s, t || 'e');
+        EXECUTE format('ALTER TABLE %I.%I OWNER TO %I', s, t || 'e', base_owner);
+    END IF;
 
     grp := '__pg_topics_sync:' || s || '.' || t;
     UPDATE topic.topic_config c SET sync_table = base, sync_key = attach.sync_key, sync_enabled = true
@@ -1375,7 +1424,7 @@ CREATE VIEW topic.partition_headroom AS
     SELECT c.schema_name, c.topic, max(b.upper::timestamptz) - now() AS headroom
     FROM topic.topic_config c
     JOIN pg_catalog.pg_inherits h
-      ON h.inhparent = format('%I.%I', c.schema_name, c.topic)::regclass
+      ON h.inhparent = to_regclass(format('%I.%I', c.schema_name, c.topic))
     JOIN pg_catalog.pg_class k ON k.oid = h.inhrelid
     CROSS JOIN LATERAL substring(pg_get_expr(k.relpartbound, k.oid) FROM ' TO \(''([^'']+)''\)$') b(upper)
     GROUP BY c.schema_name, c.topic;
@@ -1400,6 +1449,7 @@ DECLARE
     c record;
 BEGIN
     FOR c IN SELECT t.schema_name, t.topic FROM topic.topic_config t WHERE t.sync_table IS NOT NULL LOOP
+        CONTINUE WHEN to_regclass(format('%I.%I', c.schema_name, c.topic || 'e')) IS NULL;
         RETURN QUERY EXECUTE format(
             'SELECT %L::text, %L::text, count(*), count(*) FILTER (WHERE failed_at > now() - interval ''1 hour'')
              FROM %I.%I',
@@ -1435,6 +1485,7 @@ DECLARE
     c record;
 BEGIN
     FOR c IN SELECT t.schema_name, t.topic FROM topic.topic_config t LOOP
+        CONTINUE WHEN to_regclass(format('%I.%I', c.schema_name, c.topic)) IS NULL;
         RETURN QUERY
         SELECT c.schema_name, c.topic, d.band, d.log_offset, d.copies
         FROM topic.check_duplicates(c.schema_name, c.topic, false) d;
@@ -1457,13 +1508,15 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
     WITH listener AS (
         SELECT coalesce(bool_or(query LIKE 'listening on port%'), false) AS bound
-        FROM pg_catalog.pg_stat_activity WHERE backend_type = 'pg_topics listener'),
+        FROM pg_catalog.pg_stat_activity
+        WHERE backend_type = 'pg_topics listener' AND datname = current_database()),
     syncrep AS (
         SELECT EXISTS (SELECT FROM pg_catalog.pg_stat_activity WHERE wait_event = 'SyncRep') AS waiting),
     duplicates AS (SELECT DISTINCT d.schema_name, d.topic FROM topic.duplicate_offsets() d)
     SELECT c.schema_name, c.topic, c.backlog_age, c.stamped_at, h.headroom, listener.bound,
            dd.schema_name IS NOT NULL, syncrep.waiting,
-           now() - c.stamped_at <= c.max_backlog_age / 2
+           to_regclass(format('%I.%I', c.schema_name, c.topic)) IS NOT NULL
+               AND now() - c.stamped_at <= c.max_backlog_age / 2
                AND coalesce(h.headroom, interval '0') >= least(interval '1 day', c.partition_interval)
                AND listener.bound
                AND dd.schema_name IS NULL
