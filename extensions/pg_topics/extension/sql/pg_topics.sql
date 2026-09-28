@@ -211,6 +211,13 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION topic.sync_copies(standby_names text) RETURNS int
+LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT CASE WHEN btrim(standby_names) = '' THEN 1
+        ELSE 1 + coalesce((regexp_match(standby_names, '^\s*(?:(?:any|first)\s+)?(\d{1,9})\s*\(', 'i'))[1]::int, 1) END
+$$;
+
 CREATE FUNCTION topic.create_topic(
     topic text,
     band_count int DEFAULT 4,
@@ -1364,7 +1371,9 @@ BEGIN
         ('cleanup.policy', 'delete', false),
         ('message.timestamp.type', 'LogAppendTime', false),
         ('max.message.bytes', current_setting('pg_topics.max_message_bytes'), false),
-        ('pg_topics.min_durability', c.min_durability, true);
+        ('pg_topics.min_durability', c.min_durability, true),
+        ('pg_topics.replication_factor', CASE c.min_durability WHEN 'replicated'
+            THEN topic.sync_copies(current_setting('synchronous_standby_names')) ELSE 1 END::text, false);
 END
 $$;
 

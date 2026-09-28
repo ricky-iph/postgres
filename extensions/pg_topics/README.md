@@ -198,6 +198,65 @@ since version 3.0) works: a retried batch does not write a second row. Kafka
 transactions are not supported; `InitTransactions` and related calls are
 refused.
 
+### Replication factor
+
+`CreateTopics` accepts a replication factor N only when Postgres really keeps
+N copies of each commit: the primary, plus the synchronous standbys that must
+confirm each commit. `synchronous_standby_names` sets that number of standbys,
+k:
+
+| `synchronous_standby_names` | k | Largest replication factor |
+|---|---|---|
+| empty | 0 | 1 |
+| `s1` or `s1, s2` (a plain list) | 1 | 2 |
+| `2 (s1, s2)` or `FIRST 2 (s1, s2)` | 2 | 3 |
+| `ANY 1 (s1, s2)` | 1 | 2 |
+| `ANY 2 (s1, s2, s3)` | 2 | 3 |
+
+- A replication factor of 1 or -1 makes a topic as before.
+- A replication factor N from 2 to 1 + k makes the topic with
+  `min_durability` `replicated`. Each commit then waits until k standbys
+  apply it (`synchronous_commit = remote_apply`). This applies to every
+  `acks` value and to SQL publishers. It also needs
+  `pg_topics.failover_is_fenced = on`.
+- Any other N gets `INVALID_REPLICATION_FACTOR`. The message gives the number
+  of copies that the standby setup keeps.
+- N above 1 with `pg_topics.min_durability` set to a different tier gets
+  `INVALID_CONFIG`.
+
+A SQL user gets the same guarantee with
+`topic.create_topic('public.orders_q', min_durability => 'replicated')`.
+Warning: a SQL caller that lowers `synchronous_commit` after `topic.publish`
+in the same transaction loses the guarantee. The Kafka path cannot do this.
+
+`synchronous_standby_names` must name only physical standbys. A logical
+subscriber confirms the WAL position also for tables that it does not hold.
+With `FIRST k`, when fewer than k connected standbys match the names, every
+commit blocks.
+
+`Metadata` lists one replica, node 0, for each band, because pg_topics is one
+broker. A tool that counts those replicas shows a replication factor of 1.
+The read-only topic config `pg_topics.replication_factor` gives the real
+number (for example `kafka-configs --describe --all --entity-type topics
+--entity-name public.orders_q`). For a `replicated` topic it is 1 + k from
+the current `synchronous_standby_names`. For any other topic it is 1. So when
+you change `synchronous_standby_names`, the value changes too.
+`CreateTopics` checks N only when it makes the topic.
+
+Which setting to use, with a primary and two standbys `s1` and `s2`:
+
+- For replication factor 2, use a quorum: `ANY 1 (s1, s2)`. Commits continue
+  when one standby stops.
+- For replication factor 3, use `FIRST 2 (s1, s2)` or `ANY 2 (s1, s2)`.
+
+Warning: with replication factor 3 and two required standbys, one stopped
+standby blocks every commit. The commit waits with no time limit until the
+standby comes back. This is true for each commit at `synchronous_commit = on`
+or higher in the cluster, not only for topics. Waiting publishers hold their
+backends, and enough of them use all of `pg_topics.max_clients`. Monitor
+`topic.syncrep_waiters`. Read "The replicated tier" in
+`docs/plans/2026-09-27-pg-topics-design.md` before you use this tier.
+
 ## Monitoring
 
 Every view below lives in schema `topic`. `SELECT` on each one, and `EXECUTE`
@@ -237,6 +296,9 @@ from whatever already scrapes Postgres; it needs no separate exporter.
 - `Fetch` returns the record value re-serialised from `jsonb`. Field order and
   whitespace can change. A consumer that checks a signature over the raw
   bytes it sent will not match.
+- `Metadata` lists one replica for each band, also for a topic made with a
+  replication factor above 1. Read `pg_topics.replication_factor` for the
+  real number of copies (see [Replication factor](#replication-factor)).
 - A Kafka record may carry two headers with the same name. `pg_topics` keeps
   only one of them.
 - Publishing to a topic means trusting its owner. A trigger the owner puts on

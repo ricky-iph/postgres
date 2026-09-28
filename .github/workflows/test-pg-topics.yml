@@ -198,6 +198,8 @@ jobs:
           bash bench/run_security.sh
           bash bench/run_monitoring.sh
           bash bench/run_failover.sh
+          bash bench/run_replicated.sh
+          bash bench/run_band_spread.sh
           bash bench/run_client_matrix.sh
 
       - name: pg_topics untouched

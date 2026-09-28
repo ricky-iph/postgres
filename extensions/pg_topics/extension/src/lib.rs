@@ -565,6 +565,46 @@ mod tests {
     }
 
     #[pg_test]
+    fn sync_copies_counts_the_primary_and_the_required_standbys() {
+        for (names, copies) in [
+            ("", 1),
+            ("s1", 2),
+            ("s1, s2, s3", 2),
+            ("*", 2),
+            ("2, s1", 2),
+            ("\"FIRST 3 (a, b, c)\", s2", 2),
+            ("2 (s1, s2)", 3),
+            ("FIRST 2 (s1, s2)", 3),
+            ("first 3 (s1, \"s 2\", *)", 4),
+            ("ANY 1 (s1, s2)", 2),
+            ("  any\t2(\"ANY 5 (x)\", *)", 3),
+            ("ANY 99999999999 (s1)", 2),
+        ] {
+            assert_eq!(
+                Spi::get_one_with_args::<i32>(
+                    "SELECT topic.sync_copies($1)",
+                    vec![(PgBuiltInOids::TEXTOID.oid(), names.into_datum())],
+                )
+                .unwrap(),
+                Some(copies),
+                "{names}"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn describe_configs_gives_one_copy_below_the_replicated_tier() {
+        Spi::run("SELECT topic.create_topic('public.rf_q', 1)").unwrap();
+        assert_eq!(
+            one::<String>(
+                "SELECT value FROM topic.describe_configs('public.rf_q')
+                 WHERE name = 'pg_topics.replication_factor' AND NOT editable"
+            ),
+            Some("1".to_string())
+        );
+    }
+
+    #[pg_test]
     fn raw_insert_cannot_forge_offset() {
         tenant("pgt_forger");
         Spi::run("SET LOCAL ROLE pgt_forger").unwrap();

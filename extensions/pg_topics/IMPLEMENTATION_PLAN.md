@@ -672,9 +672,9 @@ Simplest design: each handler calls a Phase 1 or Phase 5 SQL function as the cli
 
 Mapping:
 
-- `CreateTopics`: name `schema.table_q`, `num_partitions` gives `band_count` (`-1` gives 4), replication factor other than 1 or `-1` gives `INVALID_REPLICATION_FACTOR`, config `retention.ms` and `pg_topics.min_durability`, any other config gives `INVALID_CONFIG` naming the key. `validate_only` runs the checks in a transaction that it rolls back.
+- `CreateTopics`: name `schema.table_q`, `num_partitions` gives `band_count` (`-1` gives 4), replication factor 1 or `-1` gives the requested tier; a replication factor N from 2 to 1 + k, where k is the number of synchronous standbys that `synchronous_standby_names` requires (`topic.sync_copies`), gives the `replicated` tier when `pg_topics.failover_is_fenced` is on; any other N gives `INVALID_REPLICATION_FACTOR` with the number of copies the standbys back (D26), config `retention.ms` and `pg_topics.min_durability`, any other config gives `INVALID_CONFIG` naming the key. `validate_only` runs the checks in a transaction that it rolls back.
 - `DeleteTopics`: `drop_topic`.
-- `DescribeConfigs` (topic resource): `retention.ms`, `cleanup.policy=delete` (read only), `message.timestamp.type=LogAppendTime` (read only), `max.message.bytes` (read only), `pg_topics.min_durability`. Broker resource: `advertised.listeners`-style entries are not needed; return an empty list.
+- `DescribeConfigs` (topic resource): `retention.ms`, `cleanup.policy=delete` (read only), `message.timestamp.type=LogAppendTime` (read only), `max.message.bytes` (read only), `pg_topics.min_durability`, `pg_topics.replication_factor` (read only: 1 + k for a `replicated` topic, else 1). Broker resource: `advertised.listeners`-style entries are not needed; return an empty list.
 - `AlterConfigs`: `retention.ms` to `set_retention`, `pg_topics.min_durability` to `set_durability`; any other key gives `INVALID_CONFIG` naming it.
 - `DeleteGroups`: `delete_group`.
 - `DescribeCluster`: one broker, cluster id = `system_identifier` as text, controller 0.
@@ -684,7 +684,7 @@ Mapping:
 Acceptance checks:
 
 1. Harness `run_kafka_admin.sh` (gate), with the Java CLI tools:
-   - `kafka-topics --create --topic public.orders_q --partitions 6 --replication-factor 1` works; `--replication-factor 3` fails with `INVALID_REPLICATION_FACTOR`; `--topic orders` gives an error naming the `schema.table_q` rule;
+   - `kafka-topics --create --topic public.orders_q --partitions 6 --replication-factor 1` works; `--replication-factor 3` fails with `INVALID_REPLICATION_FACTOR` (the harness has no standby); `--topic orders` gives an error naming the `schema.table_q` rule;
    - `kafka-topics --describe` shows 6 partitions;
    - `kafka-configs --alter --add-config retention.ms=3600000` works; `cleanup.policy=compact` fails with `INVALID_CONFIG`;
    - `kafka-consumer-groups --list` and `--describe --group g` show members and lag; the sync group shows its lag;
@@ -800,7 +800,7 @@ bash extensions/pg_topics/bench/setup_local_pg.sh
 (cd extensions/pg_topics/extension && cargo fmt --check && cargo clippy --locked --all-targets --no-default-features --features "pg17 pg_test" -- -D warnings && cargo pgrx test pg17)
 for s in run_stamp_order run_stamper run_durability run_ordering run_stamper_split run_retention run_sync \
          run_sql_consumer run_kafka_basic run_listener_restart run_kafka_groups run_kafka_idempotent \
-         run_kafka_admin run_security run_monitoring run_failover run_client_matrix; do
+         run_kafka_admin run_security run_monitoring run_failover run_replicated run_client_matrix; do
   bash extensions/pg_topics/bench/$s.sh || { echo "FAIL $s"; exit 1; }
 done
 bash extensions/pg_topics/bench/run_publish_throughput.sh
@@ -838,6 +838,7 @@ Commit: `test(pg_topics): end-to-end Kafka client matrix`.
 | D21 | `topic_config.min_session_ms`, `max_session_ms` per topic | GUCs `pg_topics.group_min_session_ms` (6000) and `pg_topics.group_max_session_ms` (1800000) | Groups are not per topic (D4). Kafka also sets these per broker (`group.min.session.timeout.ms`) |
 | D22 | Loopback to Postgres with the client's credentials; transport not stated | TCP to `127.0.0.1` only, and `system_user` must show a password-style method | A `local` trust or peer line then never matches, and any other method fails closed |
 | D23 | Retention recovers a crashed detach by scanning for tables that match the partition naming | `topic_config.detaching` records the target before the detach, and every tick resumes from it | A name match could drop a table the user detached on purpose |
+| D26 | `CreateTopics` refuses any replication factor but 1 | A replication factor N is accepted when N <= 1 + k, where k is the number of synchronous standbys that `synchronous_standby_names` requires (`FIRST k`, `k (...)` or `ANY k`; a plain list is 1), and `pg_topics.failover_is_fenced` is on. The topic gets the `replicated` tier. `Metadata` still lists node 0 as the only replica; the read-only config `pg_topics.replication_factor` reports 1 + k from the current setting. `bench/run_replicated.sh` is the gate | The user decided it. The design's rule stays true: N is accepted only when Postgres keeps N copies of each commit, so a 3 never means fewer. Node ids for standbys would be brokers that do not exist: librdkafka 2.15.1 `describe_topics` shows them with no host and port 0 |
 
 ---
 

@@ -288,6 +288,19 @@ def create_topic_validate_only(topic, partitions):
             print("validate_only", e.args[0].name(), flush=True)
 
 
+def create_topic(topic, partitions, replication_factor):
+    from confluent_kafka.admin import AdminClient, NewTopic
+    admin = AdminClient(base())
+    fs = admin.create_topics([NewTopic(topic, num_partitions=int(partitions),
+                                       replication_factor=int(replication_factor))])
+    for future in fs.values():
+        try:
+            future.result(timeout=20)
+            print("create_topic NONE", flush=True)
+        except KafkaException as e:
+            print("create_topic", e.args[0].name(), e.args[0].str(), flush=True)
+
+
 def delete_topic(topic):
     from confluent_kafka.admin import AdminClient
     admin = AdminClient(base())
@@ -345,6 +358,7 @@ if __name__ == "__main__":
      "traffic": traffic, "raw": raw, "member": member, "idempotent": idempotent, "transactional": transactional,
      "group_offsets": group_offsets, "commit": commit, "committed": committed,
      "produce_partition": produce_partition,
-     "create_topic_validate_only": create_topic_validate_only, "delete_topic": delete_topic,
+     "create_topic": create_topic, "create_topic_validate_only": create_topic_validate_only,
+     "delete_topic": delete_topic,
      "legacy_alter": legacy_alter, "incremental_alter": incremental_alter, "cluster_id": cluster_id,
      "describe_config_sources": describe_config_sources}[sys.argv[1]](*sys.argv[2:])

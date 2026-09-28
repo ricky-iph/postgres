@@ -91,6 +91,44 @@ fn resolve_band_count(num_partitions: i32) -> Result<i32, ConfigError> {
     Ok(num_partitions)
 }
 
+fn resolve_replication(
+    replication_factor: i16,
+    copies: i32,
+    fenced: bool,
+    min_durability: Option<String>,
+) -> Result<(i16, String), ConfigError> {
+    if matches!(replication_factor, 1 | -1) {
+        return Ok((
+            1,
+            min_durability.unwrap_or_else(|| DEFAULT_MIN_DURABILITY.to_string()),
+        ));
+    }
+    if !(1..=copies).contains(&i32::from(replication_factor)) {
+        return Err((
+            ResponseError::InvalidReplicationFactor.code(),
+            format!(
+                "synchronous_standby_names keeps {copies} copies of every band (the primary and {} synchronous standbys), so replication_factor must be -1 or 1 to {copies}, not {replication_factor}",
+                copies - 1
+            ),
+        ));
+    }
+    if !fenced {
+        return Err((
+            ResponseError::InvalidReplicationFactor.code(),
+            format!(
+                "replication_factor {replication_factor} needs pg_topics.failover_is_fenced = on"
+            ),
+        ));
+    }
+    match min_durability.as_deref() {
+        None | Some("replicated") => Ok((replication_factor, "replicated".to_string())),
+        Some(tier) => Err((
+            ResponseError::InvalidConfig.code(),
+            format!("replication_factor {replication_factor} needs pg_topics.min_durability replicated, not {tier}"),
+        )),
+    }
+}
+
 fn topic_configs(
     configs: &[(&str, i8, Option<&str>)],
 ) -> Result<(Option<i64>, Option<String>), ConfigError> {
@@ -133,14 +171,6 @@ fn create_topic_one(
     validate_only: bool,
 ) -> Result<CreatableTopicResult, Error> {
     let base = CreatableTopicResult::default().with_name(t.name.clone());
-    if !matches!(t.replication_factor, 1 | -1) {
-        return Ok(base
-            .with_error_code(ResponseError::InvalidReplicationFactor.code())
-            .with_error_message(Some(StrBytes::from_string(format!(
-                "pg_topics keeps one copy of every band, so replication_factor must be 1 or -1, not {}",
-                t.replication_factor
-            )))));
-    }
     let band_count = match resolve_band_count(t.num_partitions) {
         Ok(band_count) => band_count,
         Err((code, msg)) => {
@@ -168,8 +198,26 @@ fn create_topic_one(
                 .with_error_message(Some(StrBytes::from_string(msg))))
         }
     };
+    let (copies, fenced) = if matches!(t.replication_factor, 1 | -1) {
+        (1, false)
+    } else {
+        let row = tx.query_one(
+            "SELECT topic.sync_copies(current_setting('synchronous_standby_names')),
+                    current_setting('pg_topics.failover_is_fenced')::bool",
+            &[],
+        )?;
+        (row.try_get(0)?, row.try_get(1)?)
+    };
+    let (replication_factor, min_durability) =
+        match resolve_replication(t.replication_factor, copies, fenced, min_durability) {
+            Ok(resolved) => resolved,
+            Err((code, msg)) => {
+                return Ok(base
+                    .with_error_code(code)
+                    .with_error_message(Some(StrBytes::from_string(msg))))
+            }
+        };
     let retention_ms = retention_ms.unwrap_or(DEFAULT_RETENTION_MS);
-    let min_durability = min_durability.unwrap_or_else(|| DEFAULT_MIN_DURABILITY.to_string());
     let mut sp = tx.savepoint("pg_topics_create_topic")?;
     let outcome = sp.execute(
         "SELECT topic.create_topic($1, $2, ($3 || ' milliseconds')::interval, $4)",
@@ -189,7 +237,7 @@ fn create_topic_one(
             }
             Ok(base
                 .with_num_partitions(band_count)
-                .with_replication_factor(1))
+                .with_replication_factor(replication_factor))
         }
         Err(e) => {
             sp.rollback()?;
@@ -296,6 +344,7 @@ fn req_keys(r: &DescribeConfigsResource) -> Option<Vec<String>> {
 fn legacy_configs(
     entries: &[(&str, Option<&str>)],
     max_message_bytes: &str,
+    replication_factor: &str,
 ) -> Result<(i64, String), ConfigError> {
     let mut retention_ms = DEFAULT_RETENTION_MS;
     let mut min_durability = DEFAULT_MIN_DURABILITY.to_string();
@@ -312,7 +361,14 @@ fn legacy_configs(
             ("cleanup.policy", "delete") => {}
             ("message.timestamp.type", "LogAppendTime") => {}
             ("max.message.bytes", given) if given == max_message_bytes => {}
-            ("cleanup.policy" | "message.timestamp.type" | "max.message.bytes", _) => {
+            ("pg_topics.replication_factor", given) if given == replication_factor => {}
+            (
+                "cleanup.policy"
+                | "message.timestamp.type"
+                | "max.message.bytes"
+                | "pg_topics.replication_factor",
+                _,
+            ) => {
                 return Err((
                     ResponseError::InvalidConfig.code(),
                     format!("pg_topics does not allow changing {key}"),
@@ -340,16 +396,23 @@ fn alter_one(
             Some("pg_topics only alters topic configs".to_string()),
         ));
     }
-    let max_message_bytes: String = db
-        .query_one("SELECT current_setting('pg_topics.max_message_bytes')", &[])?
-        .try_get(0)?;
+    let current = match db.query_one(
+        "SELECT current_setting('pg_topics.max_message_bytes'), value
+         FROM topic.describe_configs($1) WHERE name = 'pg_topics.replication_factor'",
+        &[&r.resource_name.as_str()],
+    ) {
+        Ok(row) => row,
+        Err(e) => return topic_error(e, "AlterConfigs"),
+    };
+    let max_message_bytes: String = current.try_get(0)?;
+    let replication_factor: String = current.try_get(1)?;
     let entries: Vec<(&str, Option<&str>)> = r
         .configs
         .iter()
         .map(|c| (c.name.as_str(), c.value.as_ref().map(|v| v.as_str())))
         .collect();
-    let resolved =
-        legacy_configs(&entries, &max_message_bytes).map(|(ms, tier)| (Some(ms), Some(tier)));
+    let resolved = legacy_configs(&entries, &max_message_bytes, &replication_factor)
+        .map(|(ms, tier)| (Some(ms), Some(tier)));
     apply_alterable(
         db,
         r.resource_name.as_str(),
@@ -688,6 +751,38 @@ mod tests {
     }
 
     #[test]
+    fn resolve_replication_accepts_only_the_copies_the_standbys_back() {
+        let durable = || DEFAULT_MIN_DURABILITY.to_string();
+        let replicated = || "replicated".to_string();
+        assert_eq!(resolve_replication(1, 1, false, None), Ok((1, durable())));
+        assert_eq!(
+            resolve_replication(-1, 3, true, Some("relaxed".to_string())),
+            Ok((1, "relaxed".to_string()))
+        );
+        assert_eq!(resolve_replication(3, 3, true, None), Ok((3, replicated())));
+        assert_eq!(resolve_replication(2, 3, true, None), Ok((2, replicated())));
+        assert_eq!(
+            resolve_replication(2, 2, true, Some(replicated())),
+            Ok((2, replicated()))
+        );
+        for (rf, copies, fenced, needle) in [
+            (3, 2, true, "keeps 2 copies"),
+            (2, 1, true, "keeps 1 copies"),
+            (3, 3, false, "failover_is_fenced"),
+            (3, 2, false, "keeps 2 copies"),
+            (0, 3, true, "not 0"),
+            (-2, 3, true, "not -2"),
+        ] {
+            let (code, msg) = resolve_replication(rf, copies, fenced, None).unwrap_err();
+            assert_eq!(code, ResponseError::InvalidReplicationFactor.code(), "{rf}");
+            assert!(msg.contains(needle), "{msg}");
+        }
+        let (code, msg) = resolve_replication(3, 3, true, Some("durable".to_string())).unwrap_err();
+        assert_eq!(code, ResponseError::InvalidConfig.code());
+        assert!(msg.contains("replicated"), "{msg}");
+    }
+
+    #[test]
     fn resolve_band_count_accepts_the_default_and_the_1_to_1024_range() {
         assert_eq!(resolve_band_count(-1), Ok(4));
         assert_eq!(resolve_band_count(1), Ok(1));
@@ -709,35 +804,53 @@ mod tests {
     #[test]
     fn legacy_configs_resets_omitted_keys_and_checks_read_only_keys_against_the_given_value() {
         assert_eq!(
-            legacy_configs(&[("retention.ms", Some("3600000"))], "1048576"),
+            legacy_configs(&[("retention.ms", Some("3600000"))], "1048576", "1"),
             Ok((3_600_000, DEFAULT_MIN_DURABILITY.to_string()))
         );
         assert_eq!(
-            legacy_configs(&[], "1048576"),
+            legacy_configs(&[], "1048576", "1"),
             Ok((DEFAULT_RETENTION_MS, DEFAULT_MIN_DURABILITY.to_string()))
         );
         assert_eq!(
-            legacy_configs(&[("cleanup.policy", Some("delete"))], "1048576"),
+            legacy_configs(&[("cleanup.policy", Some("delete"))], "1048576", "1"),
             Ok((DEFAULT_RETENTION_MS, DEFAULT_MIN_DURABILITY.to_string()))
         );
         assert_eq!(
-            legacy_configs(&[("max.message.bytes", Some("1048576"))], "1048576"),
+            legacy_configs(&[("max.message.bytes", Some("1048576"))], "1048576", "1"),
             Ok((DEFAULT_RETENTION_MS, DEFAULT_MIN_DURABILITY.to_string()))
         );
         assert_eq!(
-            legacy_configs(&[("cleanup.policy", Some("compact"))], "1048576")
+            legacy_configs(&[("cleanup.policy", Some("compact"))], "1048576", "1")
                 .unwrap_err()
                 .0,
             ResponseError::InvalidConfig.code()
         );
         assert_eq!(
-            legacy_configs(&[("max.message.bytes", Some("2000000"))], "1048576")
+            legacy_configs(&[("max.message.bytes", Some("2000000"))], "1048576", "1")
                 .unwrap_err()
                 .0,
             ResponseError::InvalidConfig.code()
         );
         assert_eq!(
-            legacy_configs(&[("retention.ms", Some("-1"))], "1048576")
+            legacy_configs(
+                &[("pg_topics.replication_factor", Some("3"))],
+                "1048576",
+                "3"
+            ),
+            Ok((DEFAULT_RETENTION_MS, DEFAULT_MIN_DURABILITY.to_string()))
+        );
+        assert_eq!(
+            legacy_configs(
+                &[("pg_topics.replication_factor", Some("3"))],
+                "1048576",
+                "1"
+            )
+            .unwrap_err()
+            .0,
+            ResponseError::InvalidConfig.code()
+        );
+        assert_eq!(
+            legacy_configs(&[("retention.ms", Some("-1"))], "1048576", "1")
                 .unwrap_err()
                 .0,
             ResponseError::InvalidConfig.code()
