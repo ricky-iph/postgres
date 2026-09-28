@@ -8,16 +8,26 @@ new_cluster
 psql_as postgres "CREATE ROLE alice LOGIN PASSWORD 'alice-pw'; CREATE SCHEMA alice AUTHORIZATION alice;
   CREATE ROLE bob LOGIN PASSWORD 'bob-pw'; GRANT USAGE ON SCHEMA alice TO bob;
   CREATE ROLE carol LOGIN PASSWORD 'carol-pw'; GRANT USAGE ON SCHEMA alice TO carol;
+  CREATE ROLE dave LOGIN PASSWORD 'dave-pw'; GRANT USAGE ON SCHEMA alice TO dave;
   CREATE ROLE slow LOGIN PASSWORD 'slow-pw'; CREATE SCHEMA slow AUTHORIZATION slow;
   ALTER ROLE slow SET statement_timeout = '3s'; ALTER ROLE slow SET log_statement = 'all'" >/dev/null
-for t in java_q:1 keyed_q:4 codec_q:1 bad_q:1 wait_q:1 old_q:1 err_q:1 time_q:1 acks_q:1 big_q:1 mem_q:1 hdr_q:1; do
+for t in java_q:1 keyed_q:4 codec_q:1 bad_q:1 wait_q:1 old_q:1 err_q:1 time_q:1 acks_q:1 big_q:1 mem_q:1 hdr_q:1 \
+  offs_q:4 joffs_q:4 pub_q:4 late_q:1 drop_q:1 fast_q:1 slowc_q:3 stall_q:1; do
   psql_as alice "SELECT topic.create_topic('alice.${t%:*}', ${t#*:})" >/dev/null
 done
-psql_as alice "GRANT INSERT (band, key, value, headers, producer_timestamp) ON alice.keyed_q TO bob;
+psql_as alice "SELECT topic.grant_publish('alice.pub_q', 'dave');
+  GRANT INSERT (band, key, value, headers, producer_timestamp) ON alice.keyed_q TO bob;
   GRANT SELECT ON alice.keyed_q TO carol;
   CREATE FUNCTION alice.refuse() RETURNS trigger LANGUAGE plpgsql AS \$\$
   BEGIN RAISE EXCEPTION 'refused by a tenant trigger'; END \$\$;
-  CREATE TRIGGER refuse BEFORE INSERT ON alice.err_q FOR EACH ROW EXECUTE FUNCTION alice.refuse()" >/dev/null
+  CREATE TRIGGER refuse BEFORE INSERT ON alice.err_q FOR EACH ROW EXECUTE FUNCTION alice.refuse();
+  CREATE FUNCTION alice.drop_row() RETURNS trigger LANGUAGE plpgsql AS \$\$ BEGIN RETURN NULL; END \$\$;
+  CREATE TRIGGER drop_row BEFORE INSERT ON alice.drop_q FOR EACH ROW EXECUTE FUNCTION alice.drop_row();
+  CREATE FUNCTION alice.slow_commit() RETURNS trigger LANGUAGE plpgsql AS \$\$
+  BEGIN PERFORM pg_sleep(1); RETURN NULL; END \$\$;
+  CREATE CONSTRAINT TRIGGER slow_commit AFTER INSERT ON alice.slowc_q DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION alice.slow_commit();
+  SELECT topic.set_backlog_limit('alice.stall_q', '2 seconds')" >/dev/null
 psql_as slow "SELECT topic.create_topic('slow.s_q', 1)" >/dev/null
 
 start_listener
@@ -50,7 +60,7 @@ chk "every key lands on band_for(key, 4), as with murmur2_random" 0 \
 chk "the keys spread over all 4 bands" 4 "$(psql_as postgres "SELECT count(DISTINCT band) FROM alice.keyed_q")"
 chk "the headers are stored as a JSON array of key and value" '[{"key": "n", "value": "7"}]' \
   "$(psql_as postgres "SELECT headers FROM alice.keyed_q WHERE key = 'key-7'")"
-chk "librdkafka produces a record with repeated, binary and null headers" "ok 0 None" \
+chk "librdkafka produces a record with repeated, binary and null headers, and gets offset 0" 'ok 0 0 {"h": 1}' \
   "$(kafka_py alice alice-pw produce_headers alice.hdr_q | grep '^ok' || true)"
 chk "the headers are stored in order, and a value that is not UTF-8 is stored as value_base64" \
   '[{"key": "a", "value": "1"}, {"key": "a", "value": "2"}, {"key": "bin", "value_base64": "/wAB"}, {"key": "n", "value": null}]' \
@@ -71,6 +81,63 @@ for c in none gzip snappy lz4 zstd; do
 done
 chk "the codec topic has 50 JSON rows" 50 \
   "$(psql_as postgres "SELECT count(*) FROM alice.codec_q WHERE value ? 'i'")"
+
+out=$(kafka_py alice alice-pw produce alice.offs_q 3000 json none offs)
+chk "librdkafka gets 3000 delivery reports" 3000 "$(grep -c '^ok ' <<<"$out" || true)"
+chk "librdkafka reports the true offset of every record" 0 "$(wrong_offsets alice.offs_q "$(py_offsets "$out")")"
+batches() {
+  psql_as postgres "SELECT (SELECT max(n) > 1 FROM (SELECT count(*) AS n FROM $1 GROUP BY xact, band) b)
+                           || ' ' || EXISTS (SELECT FROM $1 GROUP BY xact HAVING count(DISTINCT band) > 1)"
+}
+chk "the librdkafka requests carried batches of many records" true "$(batches alice.offs_q | cut -d' ' -f1)"
+cp "$WORK/alice.properties" "$WORK/batch.properties"
+printf 'enable.idempotence=false\nacks=all\nlinger.ms=50\nbatch.size=1024\n' >>"$WORK/batch.properties"
+out=$(kafka_java kafka-verifiable-producer --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic alice.joffs_q \
+  --max-messages 3000 --producer.config /w/batch.properties)
+chk "the Java producer gets 3000 acks" 3000 "$(java_offsets "$out" | grep -c . || true)"
+chk "the Java producer reports the true offset of every record" 0 "$(wrong_offsets alice.joffs_q "$(java_offsets "$out")")"
+chk "the Java requests carried batches of many records, and several partitions in one request" "true true" \
+  "$(batches alice.joffs_q)"
+out=$(kafka_py dave dave-pw produce alice.pub_q 200)
+chk "a role with only grant_publish gets the true offset of every record" 0 \
+  "$(wrong_offsets alice.pub_q "$(py_offsets "$out")")"
+hold_stamp_lock alice.late_q
+out=$(kafka_py alice alice-pw produce alice.late_q 1 json none "" -1 0 all 2000)
+release_stamp_lock
+chk "a record that the stamper does not stamp within the request timeout gets REQUEST_TIMED_OUT" \
+  "err REQUEST_TIMED_OUT" "$(grep '^err' <<<"$out" || true)"
+chk "the timed-out record is committed, and the stamper gives it offset 0 later" 0 \
+  "$(wait_for "[ \"\$(unstamped alice.late_q)\" = 0 ]"; psql_as postgres "SELECT log_offset FROM alice.late_q")"
+healthy() {
+  psql_as postgres "SELECT ok FROM topic.health() WHERE topic = 'stall_q'"
+}
+wait_for "[ \"\$(healthy)\" = t ]" || true
+hold_stamp_lock alice.stall_q
+chk "while the stamper cannot stamp a topic, health() reports ok = false for it" f \
+  "$(wait_for "[ \"\$(healthy)\" = f ]" || true; healthy)"
+release_stamp_lock
+chk "when the stamper runs again, health() reports ok = true" t "$(wait_for "[ \"\$(healthy)\" = t ]" || true; healthy)"
+out=$(kafka_py alice alice-pw produce alice.drop_q 3)
+chk "when a tenant trigger drops the rows, librdkafka still gets 3 acks and no error" "3 0" \
+  "$(grep -c '^ok ' <<<"$out" || true) $(grep -c '^err' <<<"$out" || true)"
+out=$(kafka_py alice alice-pw idempotent alice.drop_q 3)
+chk "when a tenant trigger drops the rows, an idempotent producer still gets 3 acks and no error" "acked 3 failed 0" \
+  "$(grep '^acked' <<<"$out" || true)"
+PGAPPNAME=hold "$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d postgres -q -o /dev/null -c "BEGIN" \
+  -c "SELECT FROM topic.topic_band_position WHERE topic = 'fast_q' FOR NO KEY UPDATE" -c "SELECT pg_sleep(3600)" >/dev/null 2>&1 &
+wait_for "[ \"\$(psql_as postgres \"SELECT count(*) FROM pg_stat_activity WHERE application_name = 'hold' AND wait_event = 'PgSleep'\")\" = 1 ]"
+(until [ "$(psql_as postgres "SELECT count(*) FROM alice.fast_q")" = 1 ]; do sleep 0.05; done
+ sleep 0.2
+ psql_as postgres "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'hold'" >/dev/null) &
+release=$!
+out=$(kafka_py alice alice-pw pipeline alice.fast_q alice.slowc_q)
+wait "$release"
+chk "the first request is answered first, and each of the 3 slow requests is answered" "fast 3" \
+  "$(grep '^pipeline' <<<"$out" | awk '{ n = 0; for (i = 3; i <= NF; i++) if ($i ~ /^slow/) n++; print $2, n }')"
+fast=$(grep '^fast' <<<"$out" || true)
+echo "fast record answered: $fast"
+chk "the first answer has its true offset and waits for at most one slow later request (under 2 s)" "fast 0 yes" \
+  "$([[ "$fast" =~ ^fast\ ([^ ]+)\ ([0-9]+)$ ]] && echo "fast ${BASH_REMATCH[1]} $([ "${BASH_REMATCH[2]}" -lt 2000 ] && echo yes || echo no)")"
 
 chk "a value that is not JSON gets INVALID_RECORD" "err INVALID_RECORD" \
   "$(kafka_py alice alice-pw produce alice.bad_q 1 text | grep '^err' || true)"

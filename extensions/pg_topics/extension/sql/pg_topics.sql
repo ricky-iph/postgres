@@ -104,7 +104,8 @@ CREATE TABLE topic.topic_producers (
     slot           smallint    NOT NULL CHECK (slot BETWEEN 0 AND 4),
     first_sequence integer     NOT NULL,
     last_sequence  integer     NOT NULL,
-    base_offset    bigint      NOT NULL,
+    base_published_at timestamptz NOT NULL,
+    base_seq       bigint      NOT NULL,
     updated_at     timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (schema_name, topic, producer_id, band, slot),
     FOREIGN KEY (schema_name, topic, band)
@@ -138,7 +139,7 @@ CREATE FUNCTION topic.refuse_forged_insert() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
-    RAISE EXCEPTION 'topic: an insert into %.% must not set log_offset or published_by, or a published_at later than the current time',
+    RAISE EXCEPTION 'topic: an insert into %.% must not set log_offset, published_by or xact, or a published_at later than the current time',
         TG_TABLE_SCHEMA, TG_TABLE_NAME;
 END
 $$;
@@ -270,13 +271,15 @@ BEGIN
             published_by       name        NOT NULL DEFAULT current_user,
             published_at       timestamptz NOT NULL DEFAULT clock_timestamp(),
             producer_timestamp timestamptz,
+            xact               xid8        NOT NULL DEFAULT pg_current_xact_id(),
             PRIMARY KEY (published_at, seq)
         ) PARTITION BY RANGE (published_at)', s, t, band_count - 1);
-    EXECUTE format('CREATE INDEX ON %I.%I (seq) WHERE log_offset IS NULL', s, t);
+    EXECUTE format('CREATE INDEX ON %I.%I (xact, seq) WHERE log_offset IS NULL', s, t);
     EXECUTE format('CREATE INDEX ON %I.%I USING brin (log_offset) WHERE log_offset IS NOT NULL', s, t);
     EXECUTE format(
         'CREATE TRIGGER topic_refuse_forged BEFORE INSERT ON %I.%I FOR EACH ROW
-         WHEN (NEW.log_offset IS NOT NULL OR NEW.published_by <> current_user OR NEW.published_at > clock_timestamp())
+         WHEN (NEW.log_offset IS NOT NULL OR NEW.published_by <> current_user OR NEW.xact <> pg_current_xact_id()
+               OR NEW.published_at > clock_timestamp() + interval ''1 second'')
          EXECUTE FUNCTION topic.refuse_forged_insert()', s, t);
     EXECUTE format(
         'CREATE TRIGGER topic_publish_floor BEFORE INSERT ON %I.%I FOR EACH STATEMENT
@@ -741,7 +744,9 @@ AS $$
 $$;
 
 CREATE FUNCTION topic.produce_check(schema_name text, topic text, producer_id bigint, epoch smallint,
-                                    band smallint, first_seq int, last_seq int) RETURNS boolean
+                                    band smallint, first_seq int, last_seq int,
+                                    row_published_at timestamptz, row_seq bigint,
+                                    OUT duplicate boolean, OUT base_published_at timestamptz, OUT base_seq bigint)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
@@ -782,8 +787,10 @@ BEGIN
           AND p.producer_id = produce_check.producer_id AND p.band = produce_check.band;
         ring := '{}';
     END IF;
-    IF EXISTS (SELECT FROM unnest(ring) r WHERE r.first_sequence = first_seq) THEN
-        RETURN true;
+    SELECT true, r.base_published_at, r.base_seq INTO duplicate, base_published_at, base_seq
+    FROM unnest(ring) r WHERE r.first_sequence = first_seq;
+    IF duplicate THEN
+        RETURN;
     END IF;
     SELECT r.slot INTO newest FROM unnest(ring) r
     WHERE CASE WHEN r.last_sequence = 2147483647 THEN 0 ELSE r.last_sequence + 1 END = first_seq;
@@ -793,13 +800,15 @@ BEGIN
             USING ERRCODE = 'PT002';
     END IF;
     INSERT INTO topic.topic_producers
-        (schema_name, topic, producer_id, producer_epoch, band, slot, first_sequence, last_sequence, base_offset)
+        (schema_name, topic, producer_id, producer_epoch, band, slot, first_sequence, last_sequence,
+         base_published_at, base_seq)
     VALUES (produce_check.schema_name, produce_check.topic, produce_check.producer_id, epoch, produce_check.band,
-            coalesce((newest + 1) % 5, 0), first_seq, last_seq, -1)
+            coalesce((newest + 1) % 5, 0), first_seq, last_seq, row_published_at, row_seq)
     ON CONFLICT ON CONSTRAINT topic_producers_pkey DO UPDATE
     SET producer_epoch = EXCLUDED.producer_epoch, first_sequence = EXCLUDED.first_sequence,
-        last_sequence = EXCLUDED.last_sequence, base_offset = EXCLUDED.base_offset, updated_at = now();
-    RETURN false;
+        last_sequence = EXCLUDED.last_sequence, base_published_at = EXCLUDED.base_published_at,
+        base_seq = EXCLUDED.base_seq, updated_at = now();
+    SELECT false, row_published_at, row_seq INTO duplicate, base_published_at, base_seq;
 END
 $$;
 

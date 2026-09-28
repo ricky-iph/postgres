@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,6 +27,7 @@ use crate::versions::supported;
 use crate::{admin, groups, handlers};
 
 const MAX_PENDING: usize = 64;
+const MAX_DEFERRED: usize = 5;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_SLACK: usize = 64 * 1024;
 const PREAUTH_FRAME_MAX: usize = 64 * 1024;
@@ -171,6 +173,39 @@ fn tune(tcp: &TcpStream) -> io::Result<()> {
     socket2::SockRef::from(tcp).set_tcp_keepalive(&keepalive)
 }
 
+type Deferred = VecDeque<(i32, i16, handlers::Produced)>;
+
+fn ready(stream: &mut StreamOwned<ServerConnection, Deadlined>) -> io::Result<bool> {
+    let state = stream
+        .conn
+        .process_new_packets()
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    if state.plaintext_bytes_to_read() > 0 {
+        return Ok(true);
+    }
+    stream.sock.tcp.set_nonblocking(true)?;
+    let peeked = stream.sock.tcp.peek(&mut [0; 1]);
+    stream.sock.tcp.set_nonblocking(false)?;
+    match peeked {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn answer(
+    stream: &mut impl Write,
+    db: &mut postgres::Client,
+    deferred: &mut Deferred,
+) -> anyhow::Result<()> {
+    if let Some((id, version, produced)) = deferred.pop_front() {
+        let body = handlers::finish_produce(db, produced)?;
+        stream.write_all(&response(id, ApiKey::Produce, version, &body)?)?;
+        stream.flush()?;
+    }
+    Ok(())
+}
+
 fn session(shared: &Arc<Shared>, pending: Slot, tcp: TcpStream) -> anyhow::Result<()> {
     let cfg = &shared.cfg;
     tune(&tcp)?;
@@ -182,7 +217,19 @@ fn session(shared: &Arc<Shared>, pending: Slot, tcp: TcpStream) -> anyhow::Resul
     let mut pending = Some(pending);
     let mut handshake = false;
     let mut db = None;
+    let mut deferred = Deferred::new();
     loop {
+        if let Some((client, _)) = db.as_mut() {
+            while let Some((_, _, produced)) = deferred.front_mut() {
+                if !handlers::produce_ready(client, produced)? {
+                    break;
+                }
+                answer(&mut stream, client, &mut deferred)?;
+            }
+            while deferred.len() >= MAX_DEFERRED || (!deferred.is_empty() && !ready(&mut stream)?) {
+                answer(&mut stream, client, &mut deferred)?;
+            }
+        }
         let limit = match db.is_some() {
             true => cfg.max_message_bytes + FRAME_SLACK,
             false => PREAUTH_FRAME_MAX,
@@ -198,6 +245,11 @@ fn session(shared: &Arc<Shared>, pending: Slot, tcp: TcpStream) -> anyhow::Resul
             .map_err(|_| anyhow!("API key {} is not known", header.request_api_key))?;
         let version = header.request_api_version;
         let id = header.correlation_id;
+        if let (true, Some((client, _))) = (key != ApiKey::Produce, db.as_mut()) {
+            while !deferred.is_empty() {
+                answer(&mut stream, client, &mut deferred)?;
+            }
+        }
         let mut close = None;
         let out = match (key, db.as_mut()) {
             (ApiKey::ApiVersions, _) => match supported(key, version) {
@@ -263,11 +315,11 @@ fn session(shared: &Arc<Shared>, pending: Slot, tcp: TcpStream) -> anyhow::Resul
             }
             (ApiKey::Produce, Some((client, _))) => {
                 let req = ProduceRequest::decode(&mut frame, version)?;
-                let body = handlers::produce(client, &req, cfg.max_message_bytes)?;
-                match req.acks {
-                    0 => None,
-                    _ => Some(response(id, key, version, &body)?),
+                let produced = handlers::produce(client, &req, cfg.max_message_bytes)?;
+                if req.acks != 0 {
+                    deferred.push_back((id, version, produced));
                 }
+                None
             }
             (ApiKey::InitProducerId, Some((client, _))) => {
                 let req = InitProducerIdRequest::decode(&mut frame, version)?;

@@ -92,6 +92,20 @@ unstamped() {
   psql_as postgres "SELECT count(*) FROM $1 WHERE log_offset IS NULL"
 }
 
+wrong_offsets() {
+  wait_for "[ \"\$(unstamped $1)\" = 0 ]" || true
+  diff <(psql_as postgres "SELECT band || ' ' || log_offset || ' ' || value::text FROM $1" | LC_ALL=C sort) \
+    <(LC_ALL=C sort <<<"$2") | grep -c '^[<>]' || true
+}
+
+py_offsets() {
+  grep '^ok ' <<<"$1" | cut -d' ' -f2- || true
+}
+
+java_offsets() {
+  jq -rR 'fromjson? | objects | select(.name == "producer_send_success") | "\(.partition) \(.offset) \(.value)"' <<<"$1"
+}
+
 hold_stamp_lock() {
   "$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d postgres -q -o /dev/null -c "BEGIN" \
     -c "SELECT FROM topic.topic_band_position WHERE schema_name || '.' || topic = '$1' AND band = 0 FOR NO KEY UPDATE" \

@@ -48,6 +48,8 @@ out=$(kafka_java kafka-verifiable-producer --bootstrap-server "$BOOTSTRAP_HOST:$
 chk "while a stranger holds advisory locks, a Java producer with enable.idempotence=true and acks=all gets 10000 acks" \
   10000 "$(acked "$out")"
 chk "the table has exactly 10000 rows, all distinct" "10000|10000" "$(rows java_q)"
+chk "the idempotent Java producer reports the true offset of every record" 0 \
+  "$(wrong_offsets alice.java_q "$(java_offsets "$out")")"
 chk "the Java producer got one producer id from InitProducerId" 1 \
   "$(psql_as postgres "SELECT count(DISTINCT producer_id) FROM topic.topic_producers WHERE topic = 'java_q'")"
 
@@ -59,6 +61,8 @@ wait "$java"
 n=$(acked "$(cat "$WORK/java_kill.out")")
 chk "the listener restart hit a commit in flight, and the Java producer still gets 10000 acks" 10000 "$n"
 chk "the Java retries wrote no duplicate: the row count equals the acknowledged count" "$n|$n" "$(rows java_kill_q)"
+chk "the DUPLICATE answer to the Java retry gives the original offsets, as every other ack does" 0 \
+  "$(wrong_offsets alice.java_kill_q "$(java_offsets "$(cat "$WORK/java_kill.out")")")"
 
 kafka_py alice alice-pw idempotent alice.py_kill_q 10000 >"$WORK/py_kill.out" &
 py=$!
@@ -67,6 +71,8 @@ wait "$py"
 chk "librdkafka with enable.idempotence=true gets 10000 acks across the listener restart" "acked 10000 failed 0" \
   "$(grep '^acked' "$WORK/py_kill.out" || true)"
 chk "the librdkafka retries wrote no duplicate" "10000|10000" "$(rows py_kill_q)"
+chk "the DUPLICATE answer to the librdkafka retry gives the original offsets, as every other ack does" 0 \
+  "$(wrong_offsets alice.py_kill_q "$(py_offsets "$(cat "$WORK/py_kill.out")")")"
 
 out=$( (for v in 1 2 3 notjson 4 5 6 7 8; do echo "$v"; sleep 1; done) | kafka_java kafka-console-producer \
   --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic alice.epoch_q --producer.config /w/alice.properties --producer-property linger.ms=0 || true)

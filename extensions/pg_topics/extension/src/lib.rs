@@ -1,6 +1,8 @@
 // pgrx::pg_module_magic! checks every pgrx pgNN feature; only pg14..pg17 are declared here.
 #![allow(unexpected_cfgs)]
 
+use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::panic::{AssertUnwindSafe, UnwindSafe};
@@ -56,6 +58,108 @@ fn caller() -> String {
     unsafe { CStr::from_ptr(pg_sys::GetUserNameFromId(pg_sys::GetOuterUserId(), false)) }
         .to_string_lossy()
         .into_owned()
+}
+
+thread_local! {
+    static PLANS: RefCell<HashMap<String, spi::OwnedPreparedStatement>> = RefCell::new(HashMap::new());
+}
+
+fn planned<R>(
+    sql: &str,
+    args: Vec<(PgOid, Option<pg_sys::Datum>)>,
+    read: impl for<'c> FnOnce(spi::SpiTupleTable<'c>) -> spi::Result<R>,
+) -> spi::Result<R> {
+    PLANS.with_borrow_mut(|plans| {
+        Spi::connect(|client| {
+            let plan = match plans.entry(sql.to_string()) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => e.insert(
+                    client
+                        .prepare(sql, Some(args.iter().map(|a| a.0).collect()))?
+                        .keep(),
+                ),
+            };
+            read(client.select(
+                &*plan,
+                Some(1),
+                Some(args.into_iter().map(|a| a.1).collect()),
+            )?)
+        })
+    })
+}
+
+fn topic_owner(schema_name: &str, topic: &str) -> spi::Result<Option<pg_sys::Oid>> {
+    planned(
+        "SELECT (SELECT c.relowner FROM topic.topic_config t
+                 JOIN pg_catalog.pg_namespace n ON n.nspname = t.schema_name
+                 JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.topic AND c.relkind = 'p'
+                 WHERE t.schema_name = $1 AND t.topic = $2)",
+        vec![text_arg(schema_name), text_arg(topic)],
+        |t| t.first().get_one::<pg_sys::Oid>(),
+    )
+}
+
+#[pg_extern(security_definer)]
+#[search_path(pg_catalog, pg_temp)]
+fn produced_row(
+    schema_name: &str,
+    topic: &str,
+    band: i16,
+    rows: i32,
+) -> spi::Result<
+    TableIterator<'static, (name!(published_at, TimestampWithTimeZone), name!(seq, i64))>,
+> {
+    let who = caller();
+    let Some(owner) = topic_owner(schema_name, topic)?.filter(|_| rows > 0) else {
+        return Ok(TableIterator::new(vec![]));
+    };
+    let queue = spi::quote_qualified_identifier(schema_name, topic);
+    let (published_at, seq) = as_owner(owner, || {
+        planned(
+            &format!(
+                "SELECT r.published_at, r.seq FROM (VALUES (1)) v
+                 LEFT JOIN LATERAL (SELECT published_at, seq FROM {queue}
+                     WHERE log_offset IS NULL AND xact = (SELECT pg_current_xact_id()) AND band = $1
+                       AND published_by = $2
+                     ORDER BY xact DESC, seq DESC OFFSET $3 - 1 LIMIT 1) r ON true"
+            ),
+            vec![
+                (PgBuiltInOids::INT2OID.oid(), band.into_datum()),
+                text_arg(&who),
+                (PgBuiltInOids::INT4OID.oid(), rows.into_datum()),
+            ],
+            |t| t.first().get_two::<TimestampWithTimeZone, i64>(),
+        )
+    })?;
+    Ok(TableIterator::new(published_at.zip(seq)))
+}
+
+#[pg_extern(security_definer)]
+#[search_path(pg_catalog, pg_temp)]
+fn produced_offset(
+    schema_name: &str,
+    topic: &str,
+    published_at: TimestampWithTimeZone,
+    seq: i64,
+) -> spi::Result<Option<i64>> {
+    let who = caller();
+    let Some(owner) = topic_owner(schema_name, topic)? else {
+        return Ok(None);
+    };
+    let queue = spi::quote_qualified_identifier(schema_name, topic);
+    as_owner(owner, || {
+        planned(
+            &format!(
+                "SELECT (SELECT log_offset FROM {queue} WHERE published_at = $1 AND seq = $2 AND published_by = $3)"
+            ),
+            vec![
+                (PgBuiltInOids::TIMESTAMPTZOID.oid(), published_at.into_datum()),
+                (PgBuiltInOids::INT8OID.oid(), seq.into_datum()),
+                text_arg(&who),
+            ],
+            |t| t.first().get_one::<i64>(),
+        )
+    })
 }
 
 fn as_owner<R>(owner: pg_sys::Oid, f: impl FnOnce() -> R) -> R {
@@ -200,35 +304,41 @@ fn topic_worker(worker: &str, filter: &str, work: fn(&str, &str) -> spi::Result<
         Spi::run("SET search_path = pg_catalog, pg_temp; SET lock_timeout = '100ms'")
     });
     let mut retry_after: HashMap<(String, String), Instant> = HashMap::new();
+    let mut worked: HashMap<(String, String), Instant> = HashMap::new();
+    let mut topics = Vec::new();
+    let mut listed_at: Option<Instant> = None;
     let mut pause = 50;
     while wait_latch(pause) {
-        let Some(Some(topics)) = guarded(worker, || in_transaction(|| topic_list(filter))) else {
-            pause = 1000;
-            continue;
-        };
-        let mut stamped = false;
-        for (schema_name, topic) in topics {
-            if retry_after
-                .get(&(schema_name.clone(), topic.clone()))
-                .is_some_and(|at| Instant::now() < *at)
+        worked.retain(|_, at| at.elapsed() < Duration::from_millis(100));
+        let full = listed_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(50));
+        if full {
+            let Some(Some(list)) = guarded(worker, || in_transaction(|| topic_list(filter))) else {
+                pause = 1000;
+                continue;
+            };
+            topics = list;
+            listed_at = Some(Instant::now());
+        }
+        for key in &topics {
+            if !full && !worked.contains_key(key)
+                || retry_after.get(key).is_some_and(|at| Instant::now() < *at)
             {
                 continue;
             }
-            match guarded(worker, || in_transaction(|| work(&schema_name, &topic))) {
+            match guarded(worker, || in_transaction(|| work(&key.0, &key.1))) {
                 Some(n) => {
-                    stamped |= n > 0;
-                    retry_after.remove(&(schema_name, topic));
+                    if n > 0 {
+                        worked.insert(key.clone(), Instant::now());
+                    }
+                    retry_after.remove(key);
                 }
                 None => {
-                    retry_after.insert(
-                        (schema_name, topic),
-                        Instant::now() + Duration::from_secs(1),
-                    );
+                    retry_after.insert(key.clone(), Instant::now() + Duration::from_secs(1));
                 }
             }
         }
         unsafe { pg_sys::pgstat_report_stat(false) };
-        pause = if stamped { 1 } else { 50 };
+        pause = if worked.is_empty() { 50 } else { 1 };
     }
     unsafe { pg_sys::proc_exit(1) }
 }
@@ -605,6 +715,44 @@ mod tests {
     }
 
     #[pg_test]
+    fn produced_offsets_answer_only_the_publisher() {
+        tenant("pgt_po");
+        Spi::run(
+            "CREATE ROLE pgt_pub_a; CREATE ROLE pgt_pub_b;
+             GRANT USAGE ON SCHEMA pgt_po TO pgt_pub_a, pgt_pub_b;
+             SET LOCAL ROLE pgt_po;
+             SELECT topic.create_topic('pgt_po.po_q', 1);
+             SELECT topic.grant_publish('pgt_po.po_q', 'pgt_pub_a');
+             SELECT topic.grant_publish('pgt_po.po_q', 'pgt_pub_b');
+             SET LOCAL ROLE pgt_pub_a;
+             INSERT INTO pgt_po.po_q (band, value) VALUES (0, '1');
+             INSERT INTO pgt_po.po_q (band, value) VALUES (0, '2'), (0, '3');
+             RESET ROLE",
+        )
+        .unwrap();
+        let as_role = |role: &str, sql: &str| {
+            Spi::run(&format!("SET LOCAL ROLE {role}")).unwrap();
+            let got = one::<String>(sql);
+            Spi::run("RESET ROLE").unwrap();
+            got
+        };
+        let row = "SELECT string_agg(seq::text, ',') FROM topic.produced_row('pgt_po', 'po_q', 0::smallint, 2)";
+        assert_eq!(
+            as_role("pgt_pub_a", row),
+            one::<String>("SELECT seq::text FROM pgt_po.po_q WHERE value = '2'")
+        );
+        assert_eq!(as_role("pgt_pub_b", row), None);
+        Spi::run("SELECT topic.stamp_topic('pgt_po', 'po_q')").unwrap();
+        let pk = one::<String>(
+            "SELECT format('SELECT coalesce(topic.produced_offset(''pgt_po'', ''po_q'', %L, %s)::text, ''none'')',
+                           published_at, seq) FROM pgt_po.po_q WHERE value = '2'",
+        )
+        .unwrap();
+        assert_eq!(as_role("pgt_pub_a", &pk), Some("1".into()));
+        assert_eq!(as_role("pgt_pub_b", &pk), Some("none".into()));
+    }
+
+    #[pg_test]
     fn raw_insert_cannot_forge_offset() {
         tenant("pgt_forger");
         Spi::run("SET LOCAL ROLE pgt_forger").unwrap();
@@ -612,6 +760,7 @@ mod tests {
         let offset = error_of("INSERT INTO pgt_forger.forge_q (band, log_offset) VALUES (0, 7)");
         let author =
             error_of("INSERT INTO pgt_forger.forge_q (band, published_by) VALUES (0, 'someone')");
+        let group = error_of("INSERT INTO pgt_forger.forge_q (band, xact) VALUES (0, '1')");
         let future = error_of(
             "INSERT INTO pgt_forger.forge_q (band, published_at) VALUES (0, clock_timestamp() + interval '1 minute')",
         );
@@ -619,6 +768,7 @@ mod tests {
         Spi::run("RESET ROLE").unwrap();
         assert!(offset.unwrap().contains("must not set log_offset"));
         assert!(author.unwrap().contains("must not set log_offset"));
+        assert!(group.unwrap().contains("must not set log_offset"));
         assert!(
             future
                 .as_deref()
@@ -851,9 +1001,9 @@ mod tests {
              SELECT topic.create_topic('public.reaped_q', 1, partition_interval => '1 hour');
              UPDATE topic.topic_config SET offset_retention = '1 hour' WHERE topic = 'reaped_q';
              INSERT INTO topic.topic_producers
-                 (schema_name, topic, producer_id, producer_epoch, band, slot, first_sequence, last_sequence, base_offset, updated_at)
-             VALUES ('public', 'kept_q', 1, 0, 0, 0, 0, 0, -1, now() - interval '25 hours'),
-                    ('public', 'kept_q', 2, 0, 0, 0, 0, 0, -1, now() - interval '23 hours');
+                 (schema_name, topic, producer_id, producer_epoch, band, slot, first_sequence, last_sequence, base_published_at, base_seq, updated_at)
+             VALUES ('public', 'kept_q', 1, 0, 0, 0, 0, 0, now(), 1, now() - interval '25 hours'),
+                    ('public', 'kept_q', 2, 0, 0, 0, 0, 0, now(), 1, now() - interval '23 hours');
              INSERT INTO topic.producer_ids (producer_id, owner_role, created_at, last_used_at)
              VALUES (1, 'postgres', now() - interval '9 days', now() - interval '8 days'),
                     (2, 'postgres', now() - interval '9 days', now() - interval '8 days'),
@@ -1213,8 +1363,8 @@ mod tests {
              INSERT INTO topic.topic_groups (group_name, owner_role, generation_id, state)
              VALUES ('pgt_dropped', current_user, 1, 'Stable');
              INSERT INTO topic.topic_producers
-                 (schema_name, topic, producer_id, producer_epoch, band, slot, first_sequence, last_sequence, base_offset)
-             VALUES ('public', 'dropped_q', 1, 0, 0, 0, 0, 0, -1);",
+                 (schema_name, topic, producer_id, producer_epoch, band, slot, first_sequence, last_sequence, base_published_at, base_seq)
+             VALUES ('public', 'dropped_q', 1, 0, 0, 0, 0, 0, now(), 1);",
         )
         .unwrap();
         assert_eq!(
@@ -1804,7 +1954,7 @@ mod tests {
     }
 
     fn produce_check(epoch: i16, first: i32, last: i32) -> String {
-        format!("SELECT topic.produce_check('public', 'idem_q', 7, {epoch}::smallint, 0::smallint, {first}, {last})")
+        format!("SELECT duplicate FROM topic.produce_check('public', 'idem_q', 7, {epoch}::smallint, 0::smallint, {first}, {last}, now(), {first})")
     }
 
     fn accepted(epoch: i16, first: i32, last: i32) -> Option<bool> {
@@ -1855,6 +2005,19 @@ mod tests {
         assert_eq!(accepted(0, 0, 9), Some(true));
         assert_eq!(state_of(&produce_check(0, 11, 20)), Some("PT002".into()));
         assert_eq!(ring(), Some("0:0-9".into()));
+    }
+
+    #[pg_test]
+    fn producer_retry_answers_with_the_first_row_of_the_first_attempt() {
+        idem_topic();
+        assert_eq!(accepted(0, 0, 9), Some(true));
+        assert_eq!(
+            one::<String>(
+                "SELECT duplicate || ' ' || base_seq FROM topic.produce_check('public', 'idem_q', 7,
+                     0::smallint, 0::smallint, 0, 9, now(), 99)"
+            ),
+            Some("true 0".into())
+        );
     }
 
     #[pg_test]
@@ -1920,7 +2083,7 @@ mod tests {
         let check = |role: &str, id: i64| {
             Spi::run(&format!("SET LOCAL ROLE {role}")).unwrap();
             let state = state_of(&format!(
-                "SELECT topic.produce_check('public', 'idem_q', {id}, 0::smallint, 0::smallint, 0, 9)"
+                "SELECT topic.produce_check('public', 'idem_q', {id}, 0::smallint, 0::smallint, 0, 9, now(), 0)"
             ));
             Spi::run("RESET ROLE").unwrap();
             state

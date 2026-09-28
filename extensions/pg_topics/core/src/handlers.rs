@@ -1,5 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -292,6 +292,10 @@ fn rows(records: &[Record]) -> Option<Rows> {
     Some(rows)
 }
 
+type FirstRow = (SystemTime, i64);
+
+const DEFAULT_PRODUCE_WAIT: Duration = Duration::from_secs(30);
+
 fn produce_band(
     tx: &mut Transaction,
     topic: &str,
@@ -299,7 +303,7 @@ fn produce_band(
     part: &PartitionProduceData,
     max_message_bytes: usize,
     budget: &Budget,
-) -> Result<Result<i64, i16>, Error> {
+) -> Result<Result<(i64, Option<FirstRow>), i16>, Error> {
     let records = part.records.clone().unwrap_or_default();
     if records.len() > max_message_bytes {
         return Ok(Err(ResponseError::MessageTooLarge.code()));
@@ -329,47 +333,66 @@ fn produce_band(
              FROM unnest($2::text[], $3::text[], $4::text[], $5::int8[]) WITH ORDINALITY u(k, v, h, ts, n)
              ORDER BY u.n
              RETURNING clock_timestamp() AS at)
-         SELECT floor(extract(epoch FROM min(at)) * 1000)::int8 FROM ins",
+         SELECT floor(extract(epoch FROM i.at) * 1000)::int8, r.published_at, r.seq
+         FROM (SELECT min(at) AS at, count(*)::int AS n FROM ins) i
+         LEFT JOIN LATERAL topic.produced_row($6, $7, $1::smallint, i.n) r ON true",
         quote(schema),
         quote(table)
     );
     let mut sp = tx.savepoint("pg_topics_band")?;
-    let duplicate = match (records.first(), last_sequence(&records)) {
-        (Some(first), Some(last)) if first.producer_id >= 0 => sp
-            .query_one(
-                "SELECT topic.produce_check($1, $2, $3, $4, $5, $6, $7)",
-                &[
-                    &schema,
-                    &table,
-                    &first.producer_id,
-                    &first.producer_epoch,
-                    &band,
-                    &first.sequence,
-                    &last,
-                ],
-            )
-            .and_then(|row| row.try_get::<_, bool>(0)),
-        _ => Ok(false),
+    let mut write = || -> Result<(bool, Option<i64>, Option<FirstRow>), Error> {
+        let row = sp.query_one(
+            &sql,
+            &[
+                &band,
+                &rows.keys,
+                &rows.values,
+                &rows.headers,
+                &rows.timestamps,
+                &schema,
+                &table,
+            ],
+        )?;
+        let (at, published_at, seq) = (
+            row.try_get::<_, Option<i64>>(0)?,
+            row.try_get::<_, Option<SystemTime>>(1)?,
+            row.try_get::<_, Option<i64>>(2)?,
+        );
+        let idempotent = records.first().filter(|r| r.producer_id >= 0);
+        let (Some(first), Some(last), Some((published_at, seq))) =
+            (idempotent, last_sequence(&records), published_at.zip(seq))
+        else {
+            return Ok((false, at, published_at.zip(seq)));
+        };
+        let check = sp.query_one(
+            "SELECT duplicate, base_published_at, base_seq
+             FROM topic.produce_check($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &schema,
+                &table,
+                &first.producer_id,
+                &first.producer_epoch,
+                &band,
+                &first.sequence,
+                &last,
+                &published_at,
+                &seq,
+            ],
+        )?;
+        let duplicate = check.try_get::<_, bool>(0)?;
+        let base = check
+            .try_get::<_, Option<SystemTime>>(1)?
+            .zip(check.try_get::<_, Option<i64>>(2)?);
+        Ok((duplicate, if duplicate { None } else { at }, base))
     };
-    let inserted = duplicate.and_then(|duplicate| match duplicate {
-        true => Ok(None),
-        false => sp
-            .query_one(
-                &sql,
-                &[
-                    &band,
-                    &rows.keys,
-                    &rows.values,
-                    &rows.headers,
-                    &rows.timestamps,
-                ],
-            )
-            .and_then(|row| row.try_get::<_, Option<i64>>(0)),
-    });
-    match inserted {
-        Ok(at) => {
-            sp.commit()?;
-            Ok(Ok(at.unwrap_or(-1)))
+    match write() {
+        Ok((duplicate, at, base)) => {
+            if duplicate {
+                sp.rollback()?;
+            } else {
+                sp.commit()?;
+            }
+            Ok(Ok((at.unwrap_or(-1), base)))
         }
         Err(e) => {
             sp.rollback()?;
@@ -386,7 +409,12 @@ pub fn produce(
     db: &mut Client,
     req: &ProduceRequest,
     max_message_bytes: usize,
-) -> Result<ProduceResponse, Error> {
+) -> Result<Produced, Error> {
+    let wait = match req.timeout_ms {
+        ms if ms > 0 => Duration::from_millis(ms as u64),
+        _ => DEFAULT_PRODUCE_WAIT,
+    };
+    let deadline = Instant::now() + wait;
     let mut band_counts = Vec::with_capacity(req.topic_data.len());
     for t in &req.topic_data {
         let (schema, table) = split(t.name.as_str());
@@ -419,6 +447,7 @@ pub fn produce(
     ))?;
     let budget = Budget::new(max_message_bytes.saturating_mul(16));
     let mut responses = Vec::with_capacity(req.topic_data.len());
+    let mut pending = Vec::new();
     for (t, band_count) in req.topic_data.iter().zip(band_counts) {
         let mut parts = Vec::with_capacity(t.partition_data.len());
         for p in &t.partition_data {
@@ -430,7 +459,12 @@ pub fn produce(
                 max_message_bytes,
                 &budget,
             )? {
-                Ok(at) => (0, at),
+                Ok((at, first)) => {
+                    if let Some(first) = first {
+                        pending.push((responses.len(), parts.len(), first));
+                    }
+                    (0, at)
+                }
                 Err(code) => (code, -1),
             };
             parts.push(
@@ -459,8 +493,109 @@ pub fn produce(
                 p.log_append_time_ms = -1;
             }
         }
+        pending.clear();
     }
-    Ok(ProduceResponse::default().with_responses(responses))
+    Ok(Produced {
+        responses,
+        pending,
+        deadline,
+    })
+}
+
+pub struct Produced {
+    responses: Vec<TopicProduceResponse>,
+    pending: Vec<Pending>,
+    deadline: Instant,
+}
+
+pub fn produce_ready(db: &mut Client, produced: &mut Produced) -> Result<bool, Error> {
+    if !produced.pending.is_empty() {
+        read_base_offsets(db, &mut produced.responses, &mut produced.pending)?;
+    }
+    Ok(produced.pending.is_empty())
+}
+
+pub fn finish_produce(db: &mut Client, mut produced: Produced) -> Result<ProduceResponse, Error> {
+    base_offsets(
+        db,
+        &mut produced.responses,
+        produced.pending,
+        produced.deadline,
+    )?;
+    Ok(ProduceResponse::default().with_responses(produced.responses))
+}
+
+type Pending = (usize, usize, FirstRow);
+
+fn read_base_offsets(
+    db: &mut Client,
+    responses: &mut [TopicProduceResponse],
+    pending: &mut Vec<Pending>,
+) -> Result<(), Error> {
+    let names: Vec<(&str, &str)> = pending
+        .iter()
+        .map(|&(t, _, _)| split(responses[t].name.as_str()))
+        .collect();
+    let offsets = db.query(
+        "SELECT topic.produced_offset(u.s, u.t, u.at, u.seq)
+         FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::int8[]) WITH ORDINALITY u(s, t, at, seq, n)
+         ORDER BY u.n",
+        &[
+            &names.iter().map(|n| n.0).collect::<Vec<_>>(),
+            &names.iter().map(|n| n.1).collect::<Vec<_>>(),
+            &pending.iter().map(|&(_, _, (at, _))| at).collect::<Vec<_>>(),
+            &pending.iter().map(|&(_, _, (_, seq))| seq).collect::<Vec<_>>(),
+        ],
+    )?;
+    let mut left = Vec::new();
+    for (p, row) in pending.drain(..).zip(offsets) {
+        match row.try_get::<_, Option<i64>>(0)? {
+            Some(offset) => responses[p.0].partition_responses[p.1].base_offset = offset,
+            None => left.push(p),
+        }
+    }
+    *pending = left;
+    Ok(())
+}
+
+fn base_offsets(
+    db: &mut Client,
+    responses: &mut [TopicProduceResponse],
+    mut pending: Vec<Pending>,
+    deadline: Instant,
+) -> Result<(), Error> {
+    if !pending.is_empty() {
+        read_base_offsets(db, responses, &mut pending)?;
+    }
+    if !pending.is_empty() {
+        db.batch_execute("LISTEN pg_topics_stamped")?;
+        read_base_offsets(db, responses, &mut pending)?;
+        while !pending.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let woke = db
+                .notifications()
+                .timeout_iter(left.min(Duration::from_secs(5)))
+                .next()?;
+            if woke.is_some_and(|n| {
+                pending
+                    .iter()
+                    .any(|&(t, _, _)| responses[t].name.as_str() == n.payload())
+            }) {
+                read_base_offsets(db, responses, &mut pending)?;
+            }
+        }
+        db.batch_execute("UNLISTEN pg_topics_stamped")?;
+        db.notifications().iter().count()?;
+    }
+    for (t, p, _) in pending {
+        let part = &mut responses[t].partition_responses[p];
+        part.error_code = ResponseError::RequestTimedOut.code();
+        part.log_append_time_ms = -1;
+    }
+    Ok(())
 }
 
 pub fn init_producer_id(

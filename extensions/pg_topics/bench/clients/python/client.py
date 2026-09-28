@@ -40,14 +40,15 @@ def report(err, msg):
     if err:
         print("err", err.name(), flush=True)
     else:
-        print("ok", msg.partition(), msg.offset(), flush=True)
+        print("ok", msg.partition(), msg.offset(), msg.value().decode(), flush=True)
 
 
 def produce(topic, count, mode="json", compression="none", keys="", partition=-1,
-            timestamp=0, acks="all"):
+            timestamp=0, acks="all", request_timeout=30000):
     p = Producer({**base(), "partitioner": "murmur2_random", "compression.type": compression,
                   "acks": acks, "linger.ms": 50, "message.max.bytes": 64000000,
-                  "batch.size": 64000000, "message.timeout.ms": 10000, "retries": 0})
+                  "batch.size": 64000000, "message.timeout.ms": 10000, "retries": 0,
+                  "request.timeout.ms": int(request_timeout)})
     for i in range(int(count)):
         key = None
         if keys == "long":
@@ -236,12 +237,38 @@ def traffic(topic, seconds):
 def idempotent(topic, count):
     p = Producer({**base(), "enable.idempotence": True, "linger.ms": 5, "message.timeout.ms": 120000})
     acked, failed = [], []
+
+    def done(err, msg):
+        report(err, msg)
+        (failed if err else acked).append(1)
+
     for i in range(int(count)):
-        p.produce(topic, value=str(i).encode(),
-                  on_delivery=lambda err, msg: failed.append(err.name()) if err else acked.append(1))
+        p.produce(topic, value=str(i).encode(), on_delivery=done)
         p.poll(0)
     p.flush(120)
     print("acked", len(acked), "failed", len(failed), flush=True)
+
+
+def pipeline(fast, slow):
+    p = Producer({**base(), "linger.ms": 0})
+    seen = {}
+
+    def done(name):
+        return lambda err, msg: seen.setdefault(name, (time.monotonic(), err.name() if err else msg.offset()))
+
+    p.list_topics(fast, timeout=10)
+    p.list_topics(slow, timeout=10)
+    p.produce(slow, value=b'{"s": -1}', partition=0)
+    p.flush(30)
+    start = time.monotonic()
+    p.produce(fast, value=b'{"f": 1}', partition=0, on_delivery=done("fast"))
+    p.poll(0)
+    for i in range(3):
+        p.produce(slow, value=f'{{"s": {i}}}'.encode(), partition=i, on_delivery=done(f"slow{i}"))
+    p.poll(0)
+    p.flush(30)
+    print("pipeline", *sorted(seen, key=lambda k: seen[k][0]), flush=True)
+    print("fast", seen["fast"][1], int((seen["fast"][0] - start) * 1000), flush=True)
 
 
 def transactional():
@@ -381,7 +408,7 @@ def describe_config_sources(topic):
 
 if __name__ == "__main__":
     {"produce": produce, "consume": consume, "offsets": offsets, "latency": latency, "metadata": metadata,
-     "traffic": traffic, "raw": raw, "member": member, "idempotent": idempotent, "transactional": transactional,
+     "traffic": traffic, "raw": raw, "pipeline": pipeline, "member": member, "idempotent": idempotent, "transactional": transactional,
      "group_offsets": group_offsets, "commit": commit, "committed": committed,
      "produce_partition": produce_partition, "produce_headers": produce_headers, "headers": headers,
      "create_topic": create_topic, "create_topic_validate_only": create_topic_validate_only,

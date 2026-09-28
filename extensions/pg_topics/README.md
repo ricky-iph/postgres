@@ -279,6 +279,15 @@ Warning: every node runs on this one host, so replication adds no network
 latency. Docker Desktop adds one network hop through Windows to each request.
 Measure on your own hardware before you size a deployment.
 
+Warning: the tables below come from a version that answered `Produce` with
+`base_offset = -1`. Now `Produce` waits until the stamper gives the records
+their offsets. Two 60 s runs on the same machine, before and after that
+change, gave these numbers for one node at 10,000 records/s with 4 bands:
+p50 26 ms before and 28 ms after, p99 116 ms before and 142 ms after. Top
+speed went from 29,000/s to 24,700/s with 1 producer, and from 52,600/s to
+45,400/s with 4 producers. With three nodes, the p50 went from 57 ms to 70 ms
+(`FIRST 2`) and from 46 ms to 60 ms (`ANY 1`).
+
 ### One node
 
 | Test | Rate | p50 | p99 | p99.9 |
@@ -356,11 +365,30 @@ from whatever already scrapes Postgres; it needs no separate exporter.
 
 ## Known limits
 
-- `Produce` always answers `base_offset = -1`. The real offset is not known
-  until the stamper runs, after the commit. A stock client still works. Java
-  reports `-1` for each record. librdkafka reports `-1` for the first record
-  of a batch and then counts up from there, and those later numbers are not
-  real offsets.
+- With `acks=1` or `acks=all`, `Produce` answers after the commit and after
+  the stamper gives the records their offsets, so each client reports the
+  true offset of each record. When the stamper does not stamp the records
+  within the request timeout, the answer is `REQUEST_TIMED_OUT`, which a
+  client retries. The records are already committed. An idempotent producer
+  then gets a `DUPLICATE` answer with the original offsets. A producer that
+  is not idempotent writes the records a second time. This is the normal
+  at-least-once result of a Kafka retry.
+- When the stamper stalls, each `Produce` with `acks=1` or `acks=all` commits
+  its records and then times out. A producer that is not idempotent resends
+  them, and librdkafka retries up to `retries` times (by default 2147483647),
+  so it can write one record many times. Use an idempotent producer
+  (`enable.idempotence=true`; Java turns it on by default). `topic.health()`
+  reports `ok = false` for the topic when the stamper has not run on it for
+  half of `max_backlog_age`.
+- Offsets follow the order in which each transaction first wrote to the
+  queue. A SQL transaction that writes, then reads rows that another
+  transaction committed, then writes again, can get offsets below those rows.
+  To avoid it, publish from a transaction that does not write to the queue
+  before it reads. Each Kafka `Produce` request is its own transaction, so
+  Kafka producers get append order.
+- After `pg_dump` and a restore into another cluster, a restored row that has
+  no offset yet can get a higher offset than a new publish. Let the stamper
+  give every row an offset before the dump.
 - `Fetch` returns the record value re-serialised from `jsonb`. Field order and
   whitespace can change. A consumer that checks a signature over the raw
   bytes it sent will not match.

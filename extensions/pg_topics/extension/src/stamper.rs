@@ -44,7 +44,9 @@ fn stamp(schema_name: &str, topic: &str, max_rows: i32, skip_locked: bool) -> sp
     };
     let pending = as_owner(owner, || {
         read_one::<bool>(
-            &format!("SELECT EXISTS (SELECT FROM {queue} WHERE log_offset IS NULL)"),
+            &format!(
+                "SELECT (SELECT xact FROM {queue} WHERE log_offset IS NULL ORDER BY xact, seq LIMIT 1) IS NOT NULL"
+            ),
             vec![],
         )
     })?;
@@ -55,6 +57,7 @@ fn stamp(schema_name: &str, topic: &str, max_rows: i32, skip_locked: bool) -> sp
     if !taken()? {
         return Ok(0);
     }
+    let level = plain_plans();
     let (next, stamped_by) = Spi::get_two_with_args::<Vec<i64>, Vec<Option<String>>>(
         "SELECT array_agg(next_offset ORDER BY band), array_agg(stamped_by ORDER BY band)
          FROM (SELECT band, next_offset, stamped_by FROM topic.topic_band_position
@@ -69,13 +72,20 @@ fn stamp(schema_name: &str, topic: &str, max_rows: i32, skip_locked: bool) -> sp
     .unwrap_or_default();
 
     let (bands, counts, backlog) = as_owner(owner, || -> spi::Result<_> {
+        // Cut the last transaction only when no older one is open: no new row can then sort before its rest.
         let (bands, counts, exact) = Spi::get_three_with_args::<Vec<i16>, Vec<i64>, bool>(
             &format!(
-                "WITH batch AS (
-                     SELECT seq, published_at, band,
-                            row_number() OVER (PARTITION BY band ORDER BY seq) - 1 AS n
-                     FROM (SELECT seq, published_at, band FROM {queue}
-                           WHERE log_offset IS NULL ORDER BY seq LIMIT $1) s),
+                "WITH w AS (
+                     SELECT xact, seq, published_at, band FROM {queue}
+                     WHERE log_offset IS NULL ORDER BY xact, seq LIMIT $1),
+                 last AS (SELECT xact, seq FROM w ORDER BY xact DESC, seq DESC LIMIT 1),
+                 batch AS (
+                     SELECT seq, published_at, band, row_number() OVER (PARTITION BY band ORDER BY xact, seq) - 1 AS n
+                     FROM (SELECT * FROM w
+                           UNION ALL
+                           SELECT q.xact, q.seq, q.published_at, q.band FROM {queue} q, last
+                           WHERE q.log_offset IS NULL AND q.xact = last.xact AND q.seq > last.seq
+                             AND last.xact >= pg_snapshot_xmin(pg_current_snapshot())) s),
                  stamped AS (
                      UPDATE {queue} q SET log_offset = ($2::bigint[])[b.band + 1] + b.n
                      FROM batch b WHERE q.published_at = b.published_at AND q.seq = b.seq
@@ -100,7 +110,7 @@ fn stamp(schema_name: &str, topic: &str, max_rows: i32, skip_locked: bool) -> sp
         }
         let backlog = Spi::get_one::<Interval>(&format!(
             "SELECT coalesce((SELECT clock_timestamp() - published_at FROM {queue}
-                              WHERE log_offset IS NULL ORDER BY seq LIMIT 1), interval '0')"
+                              WHERE log_offset IS NULL ORDER BY xact, seq LIMIT 1), interval '0')"
         ))?;
         Ok((
             bands.unwrap_or_default(),
@@ -137,7 +147,34 @@ fn stamp(schema_name: &str, topic: &str, max_rows: i32, skip_locked: bool) -> sp
             Some(names()),
         )?;
     }
+    unsafe { pg_sys::AtEOXact_GUC(true, level) };
     Ok(total as i32)
+}
+
+fn plain_plans() -> i32 {
+    let level = unsafe { pg_sys::NewGUCNestLevel() };
+    // The estimates grow with the queue, not the batch: without these, the plans scan the queue and JIT compiles them.
+    for name in [
+        c"enable_seqscan",
+        c"enable_bitmapscan",
+        c"enable_hashjoin",
+        c"enable_mergejoin",
+        c"jit",
+    ] {
+        unsafe {
+            pg_sys::set_config_option(
+                name.as_ptr(),
+                c"off".as_ptr(),
+                pg_sys::GucContext::PGC_USERSET,
+                pg_sys::GucSource::PGC_S_SESSION,
+                pg_sys::GucAction::GUC_ACTION_SAVE,
+                true,
+                pg_sys::ERROR as i32,
+                false,
+            )
+        };
+    }
+    level
 }
 
 fn stamp_locked(schema_name: &str, topic: &str) -> spi::Result<i32> {
@@ -163,6 +200,10 @@ mod tests {
         assert_eq!(
             one::<i32>("SELECT topic.stamp_topic('public', 'gap_q')"),
             Some(10)
+        );
+        assert_eq!(
+            one::<String>("SELECT current_setting('enable_seqscan') || current_setting('jit')"),
+            Some("onon".into())
         );
         for band in 0..2 {
             assert_eq!(
