@@ -498,6 +498,14 @@ mod tests {
             Some(2)
         );
         assert_eq!(
+            one::<String>(
+                "SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_index i
+                 JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_am a ON a.oid = c.relam
+                 WHERE i.indrelid = 'public.bottles_q'::regclass AND a.amname = 'brin'"
+            ),
+            Some("(log_offset IS NOT NULL)".into())
+        );
+        assert_eq!(
             one::<i64>(
                 "SELECT count(*) FROM topic.topic_band_position
                  WHERE schema_name = 'public' AND topic = 'bottles_q'"

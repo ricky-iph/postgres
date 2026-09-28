@@ -245,7 +245,7 @@ BEGIN
             PRIMARY KEY (published_at, seq)
         ) PARTITION BY RANGE (published_at)', s, t, band_count - 1);
     EXECUTE format('CREATE INDEX ON %I.%I (seq) WHERE log_offset IS NULL', s, t);
-    EXECUTE format('CREATE INDEX ON %I.%I USING brin (log_offset)', s, t);
+    EXECUTE format('CREATE INDEX ON %I.%I USING brin (log_offset) WHERE log_offset IS NOT NULL', s, t);
     EXECUTE format(
         'CREATE TRIGGER topic_refuse_forged BEFORE INSERT ON %I.%I FOR EACH ROW
          WHEN (NEW.log_offset IS NOT NULL OR NEW.published_by <> current_user OR NEW.published_at > clock_timestamp())
