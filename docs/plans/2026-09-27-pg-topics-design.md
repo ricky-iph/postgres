@@ -935,8 +935,7 @@ SELECT :s, :t, :g, :b, g.owner_role, :n, :expected
 ON CONFLICT (schema_name, topic, group_name, band) DO UPDATE
    SET committed_offset = EXCLUDED.committed_offset,
        generation_id    = EXCLUDED.generation_id
- WHERE topic_offsets.generation_id = :expected
-   AND topic_offsets.committed_offset < :n;
+ WHERE topic_offsets.generation_id <= EXCLUDED.generation_id;
 ```
 
 It has to be an upsert. A group's rows do not exist until its first commit, and a bare `UPDATE`
@@ -947,22 +946,15 @@ update, so a plain `VALUES` insert would write whatever generation the caller cl
 holding a stale generation could plant its number on a band's first commit and fence out the member
 that actually won the band.
 
-The `committed_offset < :n` term stops a member committing a number it never read. The handler also
-caps `:n` at that band's `next_offset`, so a client cannot commit past what the server can show was
-there.
+The handler caps `:n` at that band's `next_offset`, so a client cannot commit past what the server
+can show was there.
 
-Zero rows affected has three causes, and the handler reads the row back to tell them apart.
+A commit in the current generation can move the offset back, as in Kafka. A consumer that seeks back
+and commits must resume from the lower offset after a crash. The cost is that a late retry of an
+older commit can move the offset back too. That gives duplicate delivery, never a skipped record.
 
-| Cause | Response |
-|---|---|
-| A stale generation | `ILLEGAL_GENERATION`. The client rejoins. |
-| A repeat of a commit that succeeded | `committed_offset` already holds `:n`. Return success. |
-| A superseded retry arriving late | `committed_offset` is already past `:n`. Return success. |
-
-Both success branches check the group's current `generation_id` against `:expected` first. Kafka
-fences on generation whatever the offset says. A retry of an old commit can arrive after a
-rebalance. Without that check it reads back a matching value and is told it worked, and the member
-no longer owns the band.
+Zero rows affected means a stale generation. The handler answers `ILLEGAL_GENERATION`, and the
+client rejoins.
 
 A missing group or topic raises a foreign key violation rather than affecting zero rows, and the
 handler maps that to `UNKNOWN_TOPIC_OR_PARTITION`.

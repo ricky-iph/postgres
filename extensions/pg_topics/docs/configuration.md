@@ -19,7 +19,7 @@ Only a superuser can change these settings.
 | Setting | Default | Takes effect | Meaning |
 |---|---|---|---|
 | `pg_topics.databases` | empty | Restart | A comma list of the databases that get the 4 workers. |
-| `pg_topics.failover_is_fenced` | `off` | Reload | Your promise that the old primary is stopped before a standby takes over. A topic cannot use the `durable` or `replicated` tier while this is `off`. |
+| `pg_topics.failover_is_fenced` | `off` | Reload | Your promise that the old primary is stopped before a standby takes over. pg_topics does not check it. A topic cannot use the `durable` or `replicated` tier while this is `off`. |
 | `pg_topics.port` | `9092` | Listener restart | The TCP port of the Kafka listener. `0` means no listener. Set it per database with `ALTER DATABASE`. |
 | `pg_topics.advertised_host` | `localhost` | Listener restart | The host name that `Metadata` gives to Kafka clients. Clients reconnect to this name. |
 | `pg_topics.max_clients` | `100` | Listener restart | The most Kafka clients that one listener accepts at once. Allowed range: 1 to 100000. |
@@ -272,10 +272,13 @@ The sync reads the `value` of each record as a JSON object:
 - On an insert, a missing field is NULL. On an update, a missing field keeps the current value.
 - `event_at` gets the `published_at` of the record. A record that is older than the `event_at` of the row does not overwrite it. So records on different bands can arrive in any order.
 - A record with a key and a NULL value, a tombstone, deletes the row. For a tombstone, the record key is the sync key value. The JSON value `null` is not a tombstone.
+- A tombstone deletes the row, and the sync keeps no trace of the delete. So a record for the same key with an older `published_at` that arrives after the tombstone makes the row again. This can happen when a long transaction publishes the record before the tombstone and commits after it.
 
 ### When a record fails
 
 A record that does not fit goes to the error table `shop.orders_qe`, with the reason in `error`. Two examples are a value that does not cast to the column type and a missing value for a `NOT NULL` column. The sync goes on with the next record. The record stays in the topic.
+
+Only a data error or a constraint error, SQLSTATE class 22 or 23, sends a record to the error table. Any other error stops the sync at that record, and `topic.health()` shows `ok = false`. The sync tries again each second. So a trigger on the base table that refuses a record must raise a class 22 or 23 error, for example `RAISE EXCEPTION 'bad order' USING ERRCODE = 'check_violation'`.
 
 Nothing clears the error table. Fix the cause. Then run the failed records again:
 

@@ -6,7 +6,7 @@ This guide takes you from a PostgreSQL 17 server to a working topic. A stock Kaf
 
 | Item | Detail |
 |---|---|
-| PostgreSQL | Version 17. The build also compiles for 14, 15 and 16. Nobody tests those versions, so they are not supported. |
+| PostgreSQL | Version 17. Other versions are not built or tested, so they are not supported. |
 | Server headers | The package that gives you `pg_config` and the server headers. On Debian and Ubuntu this is `postgresql-server-dev-17`. |
 | Rust | A current stable toolchain from `rustup`. |
 | `cargo-pgrx` | Version 0.12.9 exactly. Other versions do not build this extension. |
@@ -138,7 +138,7 @@ Then, as a superuser, run this in each database that you named:
 CREATE EXTENSION pg_topics;
 ```
 
-The extension puts all its objects in a schema named `topic`. The install stops with an error if a `topic` schema already exists and a non-superuser owns it or has a grant on it. In that case, drop the schema, or give it to a superuser with no grants. Then install again.
+The extension puts all its objects in a schema named `topic`. The install stops with an error if a `topic` schema already exists and a non-superuser owns it or has a grant on it. The one grant that it accepts is `USAGE` for `PUBLIC`, which a removed pg_topics leaves. In that case, drop the schema, or give it to a superuser with no grants. Then install again.
 
 ## 7. Check that it works
 
@@ -210,7 +210,7 @@ Warning: removing the extension deletes every offset, consumer group and topic s
 
 1. In each named database, drop each topic with `topic.drop_topic`, for example `SELECT topic.drop_topic('shop.orders_q');`. This drops the queue table and its control rows.
 2. Run `DROP EXTENSION pg_topics CASCADE;`. The triggers on each queue table use functions of the extension, so the command fails without `CASCADE` while any queue table is left. `CASCADE` removes those triggers and leaves the queue tables as plain tables.
-3. Run `DROP SCHEMA topic;`. `DROP EXTENSION` leaves the empty schema. `CREATE EXTENSION pg_topics` refuses to install into it again.
+3. Optional: run `DROP SCHEMA topic;`. `DROP EXTENSION` leaves the empty schema. A later `CREATE EXTENSION pg_topics` accepts it.
 4. Remove `pg_topics` from `shared_preload_libraries`.
 5. Remove the `pg_topics.*` lines from `postgresql.conf`.
 6. Restart PostgreSQL.

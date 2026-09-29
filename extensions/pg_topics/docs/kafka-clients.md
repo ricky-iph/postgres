@@ -37,6 +37,8 @@ list of limits.
 Each client produces 1000 keyed records with headers. It consumes them in a
 group of two members, commits, and resumes from the committed offset after a
 restart. The Java client also reads every batch with `check.crcs=true`.
+The results of kafkajs and franz-go are for information only. Their
+failures do not fail the test suite.
 
 ## Java
 

@@ -195,8 +195,10 @@ monitoring views and the alert rules are in [Operate](docs/operations.md).
   more machines. Standbys give failover and SQL history reads.
 - One stamper for each database gives out offsets for every topic in it,
   at about 70,000 to 100,000 records a second on the test machine.
-- Offsets follow the order in which each transaction first wrote to the
-  topic. Take a SQL transaction that publishes, reads records that another
+- The stamper gives offsets to committed records, so offsets follow commit
+  order as the stamper sees it. When one stamper pass sees several
+  committed transactions, the one that first wrote to the topic gets the
+  lower offsets. Take a SQL transaction that publishes, reads records that another
   transaction committed, and publishes again. It can get offsets below
   those records. Each Kafka `Produce` request is its own transaction, so
   Kafka producers get append order.
@@ -206,13 +208,14 @@ monitoring views and the alert rules are in [Operate](docs/operations.md).
   with no offset can get a higher offset than a new record. Before the
   dump, stamp every record.
 - A restart of PostgreSQL makes every consumer group rebalance once.
-- If you rename a queue table, its topic breaks.
+- A queue table cannot be renamed or moved to another schema.
 - If you publish to a topic, you trust its owner. A trigger that the
   owner puts on the queue table runs as the publisher.
 - The Kafka wire codec, the `kafka-protocol` crate 0.18.0, is vendored in
   `vendor/kafka-protocol` with a small patch. The patch stops a crash on a
-  malformed request and keeps repeated header names. Remove the copy when
-  upstream has both fixes.
+  malformed request and keeps repeated header names.
+  `vendor/kafka-protocol/PATCH.md` holds the full patch. Remove the copy
+  when upstream has both fixes.
 
 ## Kafka compatibility
 
@@ -232,8 +235,9 @@ protocol. This section lists every difference from Apache Kafka.
 - SASL PLAIN over TLS.
 
 These clients pass the test suite: the Java client and tools from
-`confluentinc/cp-kafka:7.7.1`, librdkafka 2.15.1, Confluent JS 1.10.1,
-kafkajs 2.2.4 and franz-go 1.22.1.
+`confluentinc/cp-kafka:7.7.1`, librdkafka 2.15.1 and Confluent JS 1.10.1.
+The suite also runs kafkajs 2.2.4 and franz-go 1.22.1, but it only reports
+their results. A failure of these two does not fail the suite.
 
 ### Not supported
 

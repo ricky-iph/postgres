@@ -66,9 +66,11 @@ future `published_at`. A trigger refuses such a row.
 ### The order of offsets
 
 A record gets its offset a short time after the commit, from the stamper
-worker. Offsets follow the order in which each transaction first wrote to
-the topic. The records of one transaction get offsets next to each other
-in each band.
+worker. The stamper gives offsets only to committed records, so offsets
+follow commit order as the stamper sees it. When one stamper pass sees
+several committed transactions, the one that first wrote to the topic gets
+the lower offsets. The records of one transaction get offsets next to each
+other in each band.
 
 Warning: a transaction can publish, then read records that another
 transaction committed, then publish again. Its last records can get offsets
