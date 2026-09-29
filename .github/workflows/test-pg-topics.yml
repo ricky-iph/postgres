@@ -43,7 +43,7 @@ jobs:
           fi
 
   unit-and-build:
-    name: unit tests + extension build (PG${{ matrix.pg }})
+    name: pg_topics unit tests + extension build (PG${{ matrix.pg }})
     runs-on: ubuntu-latest
     needs: changes
     strategy:
@@ -126,8 +126,9 @@ jobs:
           echo "required check does not block the pull request."
 
   harnesses:
-    name: bench harnesses (PG${{ matrix.pg }})
+    name: pg_topics bench harnesses (PG${{ matrix.pg }})
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     needs: changes
     strategy:
       fail-fast: false
@@ -182,25 +183,18 @@ jobs:
           PGRX_HOME: /home/runner/.cache/pg_topics/pgrx
           PG_CONFIG: /home/runner/.cache/pg_topics/pg17/usr/lib/postgresql/17/bin/pg_config
         run: |
-          bash bench/run_stamp_order.sh
-          bash bench/run_stamper.sh
-          bash bench/run_durability.sh
-          bash bench/run_ordering.sh
-          bash bench/run_stamper_split.sh
-          bash bench/run_retention.sh
-          bash bench/run_sync.sh
-          bash bench/run_sql_consumer.sh
-          bash bench/run_kafka_basic.sh
-          bash bench/run_listener_restart.sh
-          bash bench/run_kafka_groups.sh
-          bash bench/run_kafka_idempotent.sh
-          bash bench/run_kafka_admin.sh
-          bash bench/run_security.sh
-          bash bench/run_monitoring.sh
-          bash bench/run_failover.sh
-          bash bench/run_replicated.sh
-          bash bench/run_band_spread.sh
-          bash bench/run_client_matrix.sh
+          failed=""
+          for h in stamp_order stamper durability ordering stamper_split retention sync sql_consumer \
+                   kafka_basic listener_restart kafka_groups kafka_idempotent kafka_admin security \
+                   monitoring failover replicated band_spread client_matrix; do
+            echo "::group::run_$h.sh"
+            timeout 20m bash "bench/run_$h.sh" || failed="$failed run_$h.sh"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "failed harnesses:$failed"
+            exit 1
+          fi
 
       - name: pg_topics untouched
         if: needs.changes.outputs.pgt != 'true'

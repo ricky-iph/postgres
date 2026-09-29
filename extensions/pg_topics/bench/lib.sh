@@ -65,8 +65,13 @@ wait_for() {
 }
 
 cleanup() {
+  local rc=$?
   kill $(jobs -p) 2>/dev/null || true
   stop_pg >/dev/null 2>&1 || true
+  if [ "$rc" -ne 0 ] && [ -f "$PGDATA/log" ]; then
+    echo "--- last 200 lines of the server log ---"
+    tail -n 200 "$PGDATA/log"
+  fi
   rm -rf "$WORK"
 }
 
