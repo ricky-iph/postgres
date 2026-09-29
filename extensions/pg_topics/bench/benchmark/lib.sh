@@ -1,5 +1,6 @@
 write_payload_json() {
-  seq 1 100 | awk '{ printf "{\"i\": %d, \"pad\": \"%0180d\"}\n", $1, 0 }' >"$WORK/payload.json"
+  local file=${1:-payload.json} pad=${2:-180}
+  seq 1 100 | awk -v pad="$pad" '{ printf "{\"i\": %d, \"pad\": \"%0*d\"}\n", $1, pad, 0 }' >"$WORK/$file"
 }
 
 kafka_reachable() {
@@ -10,6 +11,7 @@ kafka_reachable() {
 producer_rate()  { sed -n 's/^[0-9]* records sent, \([0-9.]*\) records\/sec.*/\1/p' <<<"$1"; }
 producer_p50()   { sed -n 's/.* \([0-9]*\) ms 50th,.*/\1/p' <<<"$1"; }
 producer_p99()   { sed -n 's/.* \([0-9]*\) ms 99th,.*/\1/p' <<<"$1"; }
+producer_mb()    { sed -n 's/.* records\/sec (\([0-9.]*\) MB\/sec).*/\1/p' <<<"$1"; }
 producer_p999()  { sed -n 's/.* \([0-9.]*\) ms 99\.9th\..*/\1/p' <<<"$1"; }
 
 consumer_row()     { grep -A1 '^start.time' <<<"$1" | tail -n 1; }

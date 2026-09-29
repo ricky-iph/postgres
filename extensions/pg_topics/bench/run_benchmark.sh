@@ -72,6 +72,116 @@ produce_consume_round() {
   row "| $label, end-to-end latency | $bands | $copies | - | - | $e2e_p50 | $e2e_p99 | - | - | - |"
 }
 
+top_speed() {
+  local label=$1 topic=$2 records=$3 payload=$4
+  shift 4
+  local raw produced=""
+  psql_as alice "SELECT topic.create_topic('$topic', 4)" >/dev/null
+  if raw=$(kafka_java kafka-producer-perf-test --topic "$topic" --num-records "$records" --throughput -1 \
+    --payload-file "/w/$payload" --producer.config /w/alice.properties \
+    --producer-props "bootstrap.servers=$BOOTSTRAP_HOST:$KPORT" "$@" 2>&1); then
+    produced=$(grep 'records sent' <<<"$raw" | tail -n 1)
+  fi
+  if [ -z "$produced" ]; then
+    fail_step "$label" "$raw"
+    return 0
+  fi
+  echo "$label: $produced"
+  row "| $label | 4 | 1 | -1 | $(producer_rate "$produced") ($(producer_mb "$produced") MB/s) | $(producer_p50 "$produced") | $(producer_p99 "$produced") | $(producer_p999 "$produced") | - | - |"
+}
+
+fan_out() {
+  local topic=$1 records=$2 groups=$3 n line pids=() total=0 slowest="" ok=t
+  for n in $(seq 1 "$groups"); do
+    kafka_java kafka-consumer-perf-test --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --topic "$topic" --group "fan${groups}_$n" \
+      --messages "$records" --timeout 60000 --consumer.config /w/alice.properties >"$WORK/fan_$n.out" 2>&1 &
+    pids+=("$!")
+  done
+  for n in "${pids[@]}"; do wait "$n" || true; done
+  for n in $(seq 1 "$groups"); do
+    line=$(consumer_row "$(cat "$WORK/fan_$n.out")")
+    if [ -z "$line" ] || [ "$(cut -d, -f5 <<<"$line" | tr -d ' ')" -lt "$records" ]; then
+      fail_step "$groups groups reading at once (group $n)" "$(cat "$WORK/fan_$n.out")"
+      ok=f
+      continue
+    fi
+    total=$(awk -v a="$total" -v b="$(consumer_rate "$line")" 'BEGIN { printf "%.0f", a + b }')
+    slowest=$(awk -v a="${slowest:-1e18}" -v b="$(consumer_rate "$line")" 'BEGIN { printf "%.0f", (b + 0 < a + 0) ? b : a }')
+  done
+  [ "$ok" = t ] || return 0
+  echo "$groups groups reading at once: total $total records/s, slowest group $slowest records/s"
+  row "| $groups groups read the same topic at once | 12 | 1 | - | - | - | - | - | $total rec/s total, slowest group $slowest rec/s | - |"
+}
+
+stamper_load() {
+  local topics=$1 seconds=$2 i raw tps before after max_backlog
+  for i in $(seq 1 "$topics"); do
+    psql_as postgres "SELECT topic.create_topic('public.m${topics}_${i}_q', 4)" >/dev/null
+  done
+  printf '\\set t random(1, %s)\nSELECT bench_publish(%s, :t, 100);\n' "$topics" "$topics" >"$WORK/load_$topics.sql"
+  before=$(psql_as postgres "SELECT coalesce(sum(next_offset), 0) FROM topic.topic_band_position WHERE topic LIKE 'm${topics}\_%'")
+  : >"$WORK/load_backlog_$topics"
+  while sleep 1; do
+    psql_as postgres "SELECT extract(epoch FROM max(backlog_age)) FROM topic.topic_config WHERE topic LIKE 'm${topics}\_%'" >>"$WORK/load_backlog_$topics"
+  done &
+  local sampler=$!
+  tps=""
+  if raw=$("$PGBIN/pgbench" -h /tmp -p "$PORT" -U postgres -n -c 8 -j 8 -T "$seconds" -f "$WORK/load_$topics.sql" postgres 2>&1); then
+    tps=$(sed -n 's/^tps = \([0-9.]*\) .*/\1/p' <<<"$raw")
+  fi
+  after=$(psql_as postgres "SELECT coalesce(sum(next_offset), 0) FROM topic.topic_band_position WHERE topic LIKE 'm${topics}\_%'")
+  kill "$sampler"
+  wait "$sampler" 2>/dev/null || true
+  if [ -z "$tps" ]; then
+    fail_step "stamper load, $topics topics" "$raw"
+    return 0
+  fi
+  local parts=() unstamped_sql
+  for i in $(seq 1 "$topics"); do
+    parts+=("SELECT count(*) AS n FROM public.m${topics}_${i}_q WHERE log_offset IS NULL")
+  done
+  printf -v unstamped_sql '%s UNION ALL ' "${parts[@]}"
+  unstamped_sql="SELECT sum(n) FROM (${unstamped_sql% UNION ALL }) u"
+  local drained_s=0
+  while [ "$(psql_as postgres "$unstamped_sql")" != 0 ] && [ "$drained_s" -lt 900 ]; do
+    sleep 1
+    drained_s=$((drained_s + 1))
+  done
+  local total
+  total=$(psql_as postgres "SELECT coalesce(sum(next_offset), 0) FROM topic.topic_band_position WHERE topic LIKE 'm${topics}\_%'")
+  max_backlog=$(sort -g "$WORK/load_backlog_$topics" | tail -n 1)
+  local published=$(( total - before ))
+  echo "stamper load, $topics topics: published $((published / seconds)) rows/s, stamped $(( (after - before) / seconds )) rows/s while publishing, backlog drained ${drained_s}s after the load, max backlog_age ${max_backlog}s"
+  row "| SQL publish, 100 rows per transaction, 8 clients, $topics topics | 4 | 1 | - | $((published / seconds)) rows/s | - | - | - | stamped $(( (after - before) / seconds )) rows/s while publishing, rest ${drained_s} s later | max ${max_backlog}s |"
+}
+
+sync_throughput() {
+  local rows=$1 keys=$2 start stamped_ms synced_ms i
+  psql_as postgres "SELECT topic.create_table_topic('public.accounts', '{\"id\": \"int\", \"balance\": \"int\"}', 'id', 4)" >/dev/null
+  start=$(date +%s%N)
+  psql_as postgres "INSERT INTO public.accounts_q (band, key, value)
+                    SELECT topic.band_for((i % $keys)::text, 4), (i % $keys)::text, jsonb_build_object('id', i % $keys, 'balance', i)
+                    FROM generate_series(1, $rows) i" >/dev/null
+  stamped_ms=""
+  synced_ms=""
+  for i in $(seq 1 600); do
+    if [ -z "$stamped_ms" ] && [ "$(psql_as postgres "SELECT sum(next_offset) FROM topic.topic_band_position WHERE topic = 'accounts_q'")" = "$rows" ]; then
+      stamped_ms=$((($(date +%s%N) - start) / 1000000))
+    fi
+    if [ -n "$stamped_ms" ] && [ "$(psql_as postgres "SELECT coalesce(sum(lag), -1) FROM topic.sync_lag WHERE topic = 'accounts_q'")" = 0 ]; then
+      synced_ms=$((($(date +%s%N) - start) / 1000000))
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$synced_ms" ]; then
+    fail_step "sync worker, $rows records" "stamped after ${stamped_ms:-never} ms, not synced after 300 s"
+    return 0
+  fi
+  echo "sync worker: $rows records over $keys keys, all stamped after $stamped_ms ms, base table current after $synced_ms ms"
+  row "| sync worker keeps a base table current, $rows records over $keys keys | 4 | 1 | - | $((rows * 1000 / synced_ms)) rows/s | - | - | - | - | stamped in ${stamped_ms} ms, synced in ${synced_ms} ms |"
+}
+
 echo "== group 1: single node =="
 new_cluster
 install_release_build
@@ -91,21 +201,19 @@ if [ "$reachable" = t ]; then
     produce_consume_round "produce+consume, fixed 10000 rec/s" "$topic" "$bands" 1 10000 "$BENCH_SECONDS" "b$bands"
   done
 
+  write_payload_json payload_1k.json 1000
+  write_payload_json payload_10k.json 10000
   max_records=200000
-  topic2=alice.max1_q
-  psql_as alice "SELECT topic.create_topic('$topic2', 4)" >/dev/null
-  produced=""
-  if raw=$(kafka_java kafka-producer-perf-test --topic "$topic2" --num-records "$max_records" --throughput -1 \
-    --payload-file /w/payload.json --producer.config /w/alice.properties \
-    --producer-props "bootstrap.servers=$BOOTSTRAP_HOST:$KPORT" acks=all 2>&1); then
-    produced=$(grep 'records sent' <<<"$raw" | tail -n 1)
-  fi
-  if [ -z "$produced" ]; then
-    fail_step "max throughput, 1 producer" "$raw"
-  else
-    echo "max throughput, 1 producer: $produced"
-    row "| max throughput, 1 producer | 4 | 1 | -1 | $(producer_rate "$produced") | $(producer_p50 "$produced") | $(producer_p99 "$produced") | $(producer_p999 "$produced") | - | - |"
-  fi
+  top_speed "max throughput, 1 producer" alice.max1_q "$max_records" payload.json acks=all
+  top_speed "max throughput, 1 producer, 1 KB records" alice.max1k_q 100000 payload_1k.json acks=all
+  top_speed "max throughput, 1 producer, 10 KB records" alice.max10k_q 20000 payload_10k.json acks=all
+  top_speed "max throughput, 1 producer, lz4" alice.maxlz4_q "$max_records" payload.json acks=all compression.type=lz4
+  top_speed "max throughput, 1 producer, acks=1, not idempotent" alice.maxacks1_q "$max_records" payload.json \
+    acks=1 enable.idempotence=false
+
+  for groups in 4 8; do
+    fan_out alice.b12_q $((10000 * BENCH_SECONDS)) "$groups"
+  done
 
   topic2b=alice.max4_q
   psql_as alice "SELECT topic.create_topic('$topic2b', 4)" >/dev/null
@@ -140,6 +248,17 @@ if [ "$reachable" = t ]; then
   fi
 
 fi
+
+psql_as postgres "CREATE FUNCTION bench_publish(topics int, t int, n int) RETURNS void LANGUAGE plpgsql AS \$\$
+BEGIN
+  EXECUTE format('INSERT INTO public.%I (band, value) SELECT mod(i, 4), ''{\"v\": 1}'' FROM generate_series(1, \$1) i',
+                 'm' || topics || '_' || t || '_q') USING n;
+END \$\$" >/dev/null
+for topics in 1 10 100; do
+  stamper_load "$topics" 30
+done
+sync_throughput 200000 20000
+
 stop_pg
 rm -rf "$WORK"
 trap - EXIT
@@ -244,8 +363,10 @@ else
 fi
 echo "$sql_out"
 while read -r durability clients tps stamped backlog; do
-  row "| SQL publish (durable), $clients clients | - | 1 | - | $tps | - | - | - | ${stamped}/s | ${backlog}s |"
-done < <(awk '$1 == "durable" { print $1, $2, $3, $4, $5 }' <<<"$sql_out")
+  row "| SQL publish ($durability), $clients clients | - | 1 | - | $tps | - | - | - | ${stamped}/s | ${backlog}s |"
+done < <(awk '$1 == "durable" || $1 == "relaxed" { print $1, $2, $3, $4, $5 }' <<<"$sql_out")
+catch_up=$(sed -n 's/^catch-up of 1000000 rows after a stalled stamper: \([0-9]*\) ms$/\1/p' <<<"$sql_out")
+[ -n "$catch_up" ] && row "| stamper catch-up of 1000000 rows after a stall | 4 | 1 | - | $((1000000000 / catch_up)) rows/s | - | - | - | - | ${catch_up} ms |"
 
 echo
 echo "== summary =="

@@ -3,7 +3,9 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/lib.sh"
+source "$HERE/benchmark/lib.sh"
 new_cluster
+install_release_build
 
 seconds=${SOAK_SECONDS:-600}
 rate=10000
