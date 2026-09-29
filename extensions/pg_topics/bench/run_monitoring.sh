@@ -85,8 +85,8 @@ chk "error_rows counts the record that failed to sync" "public:mon_bottles_q:1:1
   "$(psql_as postgres "SELECT schema_name || ':' || topic || ':' || rows || ':' || recent
                        FROM topic.error_rows() WHERE topic = 'mon_bottles_q'")"
 
-psql_as postgres "SELECT topic.create_topic('public.mon_gone_q', 1);
-  ALTER TABLE public.mon_gone_q RENAME TO mon_gone_renamed" >/dev/null
+psql_as postgres "SELECT topic.create_topic('public.mon_gone_q', 1)" >/dev/null
+psql_as postgres "SET session_replication_role = replica; ALTER TABLE public.mon_gone_q RENAME TO mon_gone_renamed" >/dev/null
 out=$(psql_as postgres "SELECT topic || ':' || ok FROM topic.health() WHERE topic = 'mon_gone_q'" || true)
 echo "RED: health() after renaming the queue table of public.mon_gone_q -- $out"
 chk "health() reports ok=false for a topic whose queue table was renamed away" "mon_gone_q:false" "$out"

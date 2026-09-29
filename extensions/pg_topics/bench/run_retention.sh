@@ -345,7 +345,12 @@ psql_as postgres "SET session_replication_role = replica;
                   UPDATE tenant_b.dup_q SET log_offset = 0 WHERE log_offset IS NULL" >/dev/null
 chk "check_duplicates returns one row after a duplicate in a second partition" "0|0|2" \
   "$(psql_as postgres "SELECT band, log_offset, copies FROM topic.check_duplicates('tenant_b', 'dup_q', full => true)")"
-psql_as tenant_a "ALTER TABLE tenant_a.evil_q RENAME TO gone; DROP TABLE tenant_a.gone;
+refused=$(psql_as tenant_a "ALTER TABLE tenant_a.evil_q RENAME TO gone" 2>&1 || true)
+echo "RED: the tenant renames its queue table -- $refused"
+chk "a tenant cannot rename its queue table" yes \
+  "$(grep -q 'a queue table must keep its name and schema' <<<"$refused" && echo yes || echo no)"
+psql_as postgres "SET session_replication_role = replica; ALTER TABLE tenant_a.evil_q RENAME TO gone" >/dev/null
+psql_as tenant_a "DROP TABLE tenant_a.gone;
                   CREATE VIEW tenant_a.evil_q AS
                   SELECT 0::smallint AS band, 0::bigint AS log_offset, now() AS published_at, 0::bigint AS seq
                   WHERE tenant_a.probe('view', 0::smallint)" >/dev/null

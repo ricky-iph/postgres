@@ -829,6 +829,55 @@ mod tests {
     }
 
     #[pg_test]
+    fn a_queue_table_keeps_its_name_and_schema() {
+        Spi::run("SELECT topic.create_topic('public.named_q', 1); CREATE SCHEMA pgt_elsewhere")
+            .unwrap();
+        for ddl in [
+            "ALTER TABLE public.named_q RENAME TO other_q",
+            "ALTER TABLE public.named_q SET SCHEMA pgt_elsewhere",
+        ] {
+            assert_eq!(
+                error_of(ddl),
+                Some("topic: a queue table must keep its name and schema".into()),
+                "{ddl}"
+            );
+        }
+        Spi::run("ALTER TABLE public.named_q ADD COLUMN note text").unwrap();
+        assert_eq!(
+            one::<bool>("SELECT to_regclass('public.named_q') IS NOT NULL"),
+            Some(true)
+        );
+    }
+
+    #[pg_test]
+    fn a_superuser_deletes_a_group_whose_owner_is_gone() {
+        Spi::run(
+            "INSERT INTO topic.topic_groups (group_name, owner_role) VALUES ('pgt_orphan', 'pgt_gone_owner');
+             SELECT topic.delete_group('pgt_orphan')",
+        )
+        .unwrap();
+        assert_eq!(
+            one::<i64>("SELECT count(*) FROM topic.topic_groups WHERE group_name = 'pgt_orphan'"),
+            Some(0)
+        );
+    }
+
+    #[pg_test]
+    fn stamp_raises_synchronous_commit() {
+        Spi::run(
+            "SELECT topic.create_topic('public.floor_q', 1);
+             SELECT topic.publish('public.floor_q', '{}');
+             SET LOCAL synchronous_commit = off",
+        )
+        .unwrap();
+        assert_eq!(
+            one::<i32>("SELECT topic.stamp_topic('public', 'floor_q')"),
+            Some(1)
+        );
+        assert_eq!(one::<String>("SHOW synchronous_commit"), Some("on".into()));
+    }
+
+    #[pg_test]
     fn caller_sees_set_role_inside_definer() {
         Spi::run("CREATE ROLE pgt_caller").unwrap();
         Spi::run(
@@ -969,10 +1018,13 @@ mod tests {
     fn queue_functions_refuse_a_view_in_place_of_the_queue() {
         tenant("pgt_view");
         Spi::run("SET LOCAL ROLE pgt_view").unwrap();
+        Spi::run("SELECT topic.create_topic('pgt_view.v_q', 1, partition_interval => '1 hour')")
+            .unwrap();
+        Spi::run("RESET ROLE; SET LOCAL session_replication_role = replica").unwrap();
+        Spi::run("ALTER TABLE pgt_view.v_q RENAME TO gone").unwrap();
+        Spi::run("RESET session_replication_role; SET LOCAL ROLE pgt_view").unwrap();
         Spi::run(
-            "SELECT topic.create_topic('pgt_view.v_q', 1, partition_interval => '1 hour');
-             ALTER TABLE pgt_view.v_q RENAME TO gone;
-             DROP TABLE pgt_view.gone;
+            "DROP TABLE pgt_view.gone;
              CREATE VIEW pgt_view.v_q AS
                  SELECT 0::smallint AS band, 0::bigint AS log_offset, now() AS published_at, 0::bigint AS seq",
         )
@@ -1456,7 +1508,7 @@ mod tests {
         assert_eq!(c(12, 4), Some("ILLEGAL_GENERATION".into()));
         assert_eq!(c(10, 5), Some("NONE".into()));
         assert_eq!(c(8, 5), Some("NONE".into()));
-        assert_eq!(stored(), Some("10@5".into()));
+        assert_eq!(stored(), Some("8@5".into()));
         Spi::run("UPDATE topic.topic_groups SET generation_id = 6 WHERE group_name = 'pgt_fence'")
             .unwrap();
         assert_eq!(c(10, 5), Some("ILLEGAL_GENERATION".into()));
@@ -1577,7 +1629,7 @@ mod tests {
         };
         assert_eq!(c(10, 4), Some("NONE".into()));
         assert_eq!(c(3, 4), Some("NONE".into()));
-        assert_eq!(stored(), Some("10@4".into()));
+        assert_eq!(stored(), Some("3@4".into()));
         assert_eq!(c(3, -1), Some("NONE".into()));
         assert_eq!(stored(), Some("3@4".into()));
         assert_eq!(c(99, -1), Some("NONE".into()));
@@ -1968,6 +2020,15 @@ mod tests {
         )
     }
 
+    fn seed_ring(first: i32, last: i32) {
+        Spi::run(&format!(
+            "INSERT INTO topic.topic_producers (schema_name, topic, producer_id, producer_epoch, band, slot,
+                                                first_sequence, last_sequence, base_published_at, base_seq)
+             VALUES ('public', 'idem_q', 7, 0, 0, 0, {first}, {last}, now(), 0)"
+        ))
+        .unwrap();
+    }
+
     fn idem_topic() {
         Spi::run(
             "SELECT topic.create_topic('public.idem_q', 1);
@@ -2031,17 +2092,32 @@ mod tests {
     #[pg_test]
     fn producer_sequence_wraps() {
         idem_topic();
+        seed_ring(2147483500, 2147483599);
         assert_eq!(accepted(0, 2147483600, 2147483647), Some(true));
         assert_eq!(accepted(0, 0, 9), Some(true));
         assert_eq!(accepted(0, 0, 9), Some(false));
-        assert_eq!(ring(), Some("0:2147483600-2147483647,0:0-9".into()));
+        assert_eq!(
+            ring(),
+            Some("0:2147483500-2147483599,0:2147483600-2147483647,0:0-9".into())
+        );
     }
 
     #[pg_test]
     fn producer_batch_across_the_wrap_is_followed_by_its_next_sequence() {
         idem_topic();
+        seed_ring(2147483500, 2147483599);
         assert_eq!(accepted(0, 2147483600, 12), Some(true));
         assert_eq!(accepted(0, 13, 20), Some(true));
+    }
+
+    #[pg_test]
+    fn producer_with_no_state_must_start_at_sequence_0() {
+        idem_topic();
+        assert_eq!(state_of(&produce_check(0, 10, 19)), Some("PT004".into()));
+        assert_eq!(ring(), None);
+        assert_eq!(accepted(0, 0, 9), Some(true));
+        assert_eq!(state_of(&produce_check(1, 10, 19)), Some("PT002".into()));
+        assert_eq!(ring(), Some("0:0-9".into()));
     }
 
     #[pg_test]

@@ -181,6 +181,14 @@ chk "kafka-consumer-groups --delete --group g works" yes \
   "$(grep -qi 'successful' <<<"$out" && echo yes || echo no)"
 chk "the group row is gone" 0 "$(psql_as postgres "SELECT count(*) FROM topic.topic_groups WHERE group_name = 'g'")"
 
+out=$(kafka_java kafka-consumer-groups --bootstrap-server "$BOOTSTRAP_HOST:$KPORT" --command-config /w/alice.properties \
+  --reset-offsets --group fresh --topic alice.grp_q --to-latest --execute)
+echo "$out"
+chk "--reset-offsets --execute makes the offsets of a group that does not exist yet" "2|true" \
+  "$(psql_as postgres "SELECT count(*) || '|' || bool_and(o.committed_offset = p.next_offset)
+     FROM topic.topic_offsets o JOIN topic.topic_band_position p USING (schema_name, topic, band)
+     WHERE o.group_name = 'fresh'")"
+
 psql_as alice "SELECT topic.create_table_topic('alice.things', '{\"thing_id\": \"int\", \"n\": \"int\"}', 'thing_id', 2)" >/dev/null
 psql_as alice "SELECT topic.publish('alice.things_q', jsonb_build_object('thing_id', i, 'n', i)) FROM generate_series(1, 10) i" >/dev/null
 wait_for "[ \"\$(psql_as postgres \"SELECT bool_and(o.committed_offset = p.next_offset)

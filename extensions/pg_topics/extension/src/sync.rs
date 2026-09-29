@@ -92,8 +92,8 @@ fn merge_sql(base: &str, key: &str, columns: &[String], source: &str) -> String 
                  FROM {source} u) s
              ORDER BY (s.p).{k}, s.published_at DESC, s.band DESC, s.log_offset DESC)
          MERGE INTO {base} t USING r ON t.{k} = (r.p).{k}
-         WHEN MATCHED AND r.value IS NULL AND t.event_at < r.published_at THEN DELETE
-         WHEN MATCHED AND t.event_at < r.published_at THEN UPDATE SET {set}, event_at = r.published_at
+         WHEN MATCHED AND r.value IS NULL AND t.event_at <= r.published_at THEN DELETE
+         WHEN MATCHED AND t.event_at <= r.published_at THEN UPDATE SET {set}, event_at = r.published_at
          WHEN NOT MATCHED AND r.value IS NOT NULL THEN INSERT ({names}, event_at) VALUES ({values}, r.published_at)",
         lit = quote_literal(key),
         names = quoted.join(", "),
@@ -529,6 +529,20 @@ mod tests {
             )),
             Some(true)
         );
+    }
+
+    #[pg_test]
+    fn sync_applies_a_later_record_with_the_same_published_at() {
+        bottles();
+        for name in ["first", "second"] {
+            Spi::run(&format!(
+                r#"INSERT INTO public.bottles_q (band, value, published_at)
+                   VALUES (0, '{{"bottle_id": "{U1}", "name": "{name}"}}', now() - interval '1 minute')"#
+            ))
+            .unwrap();
+            assert_eq!(sync(), Some(1));
+        }
+        assert_eq!(row(U1), Some("second".into()));
     }
 
     #[pg_test]

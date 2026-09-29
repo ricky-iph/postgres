@@ -1,8 +1,8 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ use crate::versions::supported;
 use crate::{admin, groups, handlers};
 
 const MAX_PENDING: usize = 64;
+const MAX_PENDING_PER_HOST: usize = 16;
 const MAX_DEFERRED: usize = 5;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_SLACK: usize = 64 * 1024;
@@ -59,6 +60,7 @@ struct Shared {
     cfg: Config,
     pending: AtomicUsize,
     clients: AtomicUsize,
+    hosts: Hosts,
 }
 
 struct Slot(Arc<Shared>, bool);
@@ -81,6 +83,33 @@ impl Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         self.counter().fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+type Hosts = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+struct HostSlot(Hosts, IpAddr);
+
+impl HostSlot {
+    fn take(hosts: &Hosts, host: IpAddr) -> Option<HostSlot> {
+        let mut counts = hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        let n = counts.entry(host).or_insert(0);
+        (*n < MAX_PENDING_PER_HOST).then(|| {
+            *n += 1;
+            HostSlot(hosts.clone(), host)
+        })
+    }
+}
+
+impl Drop for HostSlot {
+    fn drop(&mut self) {
+        let mut counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = counts.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.1);
+            }
+        }
     }
 }
 
@@ -206,7 +235,7 @@ fn answer(
     Ok(())
 }
 
-fn session(shared: &Arc<Shared>, pending: Slot, tcp: TcpStream) -> anyhow::Result<()> {
+fn session(shared: &Arc<Shared>, pending: (Slot, HostSlot), tcp: TcpStream) -> anyhow::Result<()> {
     let cfg = &shared.cfg;
     tune(&tcp)?;
     let sock = Deadlined {
@@ -485,7 +514,9 @@ pub fn run(listener: TcpListener, cfg: Config) {
         cfg,
         pending: AtomicUsize::new(0),
         clients: AtomicUsize::new(0),
+        hosts: Hosts::default(),
     });
+    let mut refused_at: Option<Instant> = None;
     for tcp in listener.incoming() {
         let tcp = match tcp {
             Ok(tcp) => tcp,
@@ -495,7 +526,22 @@ pub fn run(listener: TcpListener, cfg: Config) {
                 continue;
             }
         };
-        let Some(pending) = Slot::take(&shared, false, MAX_PENDING) else {
+        let host = match tcp.peer_addr() {
+            Ok(addr) => addr.ip(),
+            Err(e) => {
+                eprintln!("pg_topics listener: a new connection has no peer address: {e}");
+                continue;
+            }
+        };
+        let pending = HostSlot::take(&shared.hosts, host)
+            .and_then(|h| Some((Slot::take(&shared, false, MAX_PENDING)?, h)));
+        let Some(pending) = pending else {
+            if refused_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(10)) {
+                eprintln!(
+                    "pg_topics listener: refused a connection from {host}: too many connections from it, or {MAX_PENDING} in all, have not authenticated yet"
+                );
+                refused_at = Some(Instant::now());
+            }
             continue;
         };
         let conn = shared.clone();
@@ -562,6 +608,20 @@ mod tests {
         };
         assert_eq!(sock.left().unwrap(), Some(IDLE_TIMEOUT));
         assert_eq!(IDLE_TIMEOUT, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn one_host_gets_at_most_its_share_of_pending_slots() {
+        let hosts = Hosts::default();
+        let (a, b) = (IpAddr::from([10, 0, 0, 1]), IpAddr::from([10, 0, 0, 2]));
+        let taken: Vec<_> = (0..MAX_PENDING_PER_HOST)
+            .map(|_| HostSlot::take(&hosts, a).unwrap())
+            .collect();
+        assert!(HostSlot::take(&hosts, a).is_none());
+        assert!(HostSlot::take(&hosts, b).is_some());
+        drop(taken);
+        assert!(HostSlot::take(&hosts, a).is_some());
+        assert!(hosts.lock().unwrap().is_empty());
     }
 
     #[test]

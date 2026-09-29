@@ -626,8 +626,8 @@ pub fn describe_groups(
         if !found {
             groups.push(
                 DescribedGroup::default()
-                    .with_error_code(ResponseError::GroupIdNotFound.code())
-                    .with_group_id(g.clone()),
+                    .with_group_id(g.clone())
+                    .with_group_state(StrBytes::from_static_str("Dead")),
             );
             continue;
         }
@@ -974,8 +974,8 @@ mod tests {
         });
         round_trip(ApiKey::DescribeGroups, |_| {
             DescribeGroupsResponse::default().with_groups(vec![DescribedGroup::default()
-                .with_error_code(ResponseError::GroupIdNotFound.code())
-                .with_group_id(GroupId(name("ghost")))])
+                .with_group_id(GroupId(name("ghost")))
+                .with_group_state(name("Dead"))])
         });
     }
 }

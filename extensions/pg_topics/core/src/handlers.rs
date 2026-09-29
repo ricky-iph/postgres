@@ -411,7 +411,7 @@ pub fn produce(
     max_message_bytes: usize,
 ) -> Result<Produced, Error> {
     let wait = match req.timeout_ms {
-        ms if ms > 0 => Duration::from_millis(ms as u64),
+        ms if ms > 0 => max_wait(ms),
         _ => DEFAULT_PRODUCE_WAIT,
     };
     let deadline = Instant::now() + wait;
@@ -443,7 +443,7 @@ pub fn produce(
     )?;
     tx.batch_execute(&format!(
         "SET LOCAL statement_timeout = {}",
-        req.timeout_ms.max(0)
+        wait.as_millis()
     ))?;
     let budget = Budget::new(max_message_bytes.saturating_mul(16));
     let mut responses = Vec::with_capacity(req.topic_data.len());

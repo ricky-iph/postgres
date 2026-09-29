@@ -57,6 +57,11 @@ fn stamp(schema_name: &str, topic: &str, max_rows: i32, skip_locked: bool) -> sp
     if !taken()? {
         return Ok(0);
     }
+    Spi::run_with_args(
+        "SELECT topic.raise_synchronous_commit(min_durability) FROM topic.topic_config
+         WHERE schema_name = $1 AND topic = $2",
+        Some(names()),
+    )?;
     let level = plain_plans();
     let (next, stamped_by) = Spi::get_two_with_args::<Vec<i64>, Vec<Option<String>>>(
         "SELECT array_agg(next_offset ORDER BY band), array_agg(stamped_by ORDER BY band)

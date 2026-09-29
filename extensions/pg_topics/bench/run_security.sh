@@ -362,5 +362,12 @@ chk "CREATE EXTENSION refuses a topic schema that a non-superuser owns" yes \
 chk "the refused CREATE EXTENSION installs nothing in hijack_db" f \
   "$("$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d hijack_db -tAc "SELECT EXISTS (SELECT FROM pg_extension WHERE extname = 'pg_topics')")"
 
+psql_as postgres "CREATE DATABASE reinstall_db" >/dev/null
+"$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d reinstall_db -c "CREATE EXTENSION pg_topics" -c "DROP EXTENSION pg_topics" >/dev/null
+out=$("$PGBIN/psql" -h /tmp -p "$PORT" -U postgres -d reinstall_db -c "CREATE EXTENSION pg_topics" 2>&1 || true)
+echo "CREATE EXTENSION after DROP EXTENSION -- $out"
+chk "CREATE EXTENSION works again after DROP EXTENSION" yes \
+  "$(grep -qx 'CREATE EXTENSION' <<<"$out" && echo yes || echo no)"
+
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

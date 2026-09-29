@@ -261,9 +261,9 @@ closed() {
   done
   echo "$n"
 }
-chk "of 70 idle connections that never authenticate, the 65th and later are closed" 6 "$(closed)"
+chk "of 70 idle connections from one host that never authenticate, the 17th and later are closed" 54 "$(closed)"
 sleep 10
-chk "the listener closes the other 64 when 10 s pass with no SASL" 70 "$(closed)"
+chk "the listener closes the other 16 when 10 s pass with no SASL" 70 "$(closed)"
 for fd in "${fds[@]}"; do exec {fd}<&-; done
 chk "a real client still connects" "ok 0" "$(kafka_py alice alice-pw produce alice.wait_q 1 | grep -o '^ok 0' || true)"
 

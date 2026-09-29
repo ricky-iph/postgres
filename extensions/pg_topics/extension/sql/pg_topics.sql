@@ -3,7 +3,8 @@ BEGIN
     IF EXISTS (
         SELECT FROM pg_catalog.pg_namespace n
         WHERE n.nspname = 'topic'
-          AND (n.nspacl IS NOT NULL
+          AND (EXISTS (SELECT FROM pg_catalog.aclexplode(n.nspacl) a
+                       WHERE a.grantee <> n.nspowner AND NOT (a.grantee = 0 AND a.privilege_type = 'USAGE'))
                OR NOT EXISTS (SELECT FROM pg_catalog.pg_roles r WHERE r.oid = n.nspowner AND r.rolsuper))
     ) THEN
         RAISE EXCEPTION 'pg_topics: schema topic already exists. A non-superuser owns it, or a grant exists on it.'
@@ -144,13 +145,24 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION topic.raise_synchronous_commit(min_durability text) RETURNS void
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    levels text[] := ARRAY['off', 'local', 'remote_write', 'on', 'remote_apply'];
+    wanted text := CASE min_durability WHEN 'relaxed' THEN 'off' WHEN 'durable' THEN 'on' ELSE 'remote_apply' END;
+BEGIN
+    IF array_position(levels, wanted) > array_position(levels, current_setting('synchronous_commit')) THEN
+        PERFORM set_config('synchronous_commit', wanted, true);
+    END IF;
+END
+$$;
+
 CREATE FUNCTION topic.publish_floor() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     c topic.topic_config;
-    levels text[] := ARRAY['off', 'local', 'remote_write', 'on', 'remote_apply'];
-    wanted text;
 BEGIN
     SELECT * INTO c FROM topic.topic_config t
     WHERE t.schema_name = TG_TABLE_SCHEMA AND t.topic = TG_TABLE_NAME;
@@ -165,10 +177,7 @@ BEGIN
         RAISE EXCEPTION 'topic: the stamper has not run on %.% since %, which is longer than max_backlog_age %',
             TG_TABLE_SCHEMA, TG_TABLE_NAME, c.stamped_at, c.max_backlog_age;
     END IF;
-    wanted := CASE c.min_durability WHEN 'relaxed' THEN 'off' WHEN 'durable' THEN 'on' ELSE 'remote_apply' END;
-    IF array_position(levels, wanted) > array_position(levels, current_setting('synchronous_commit')) THEN
-        PERFORM set_config('synchronous_commit', wanted, true);
-    END IF;
+    PERFORM topic.raise_synchronous_commit(c.min_durability);
     RETURN NULL;
 END
 $$;
@@ -794,7 +803,12 @@ BEGIN
     END IF;
     SELECT r.slot INTO newest FROM unnest(ring) r
     WHERE CASE WHEN r.last_sequence = 2147483647 THEN 0 ELSE r.last_sequence + 1 END = first_seq;
-    IF cardinality(ring) > 0 AND newest IS NULL THEN
+    IF cardinality(ring) = 0 AND first_seq <> 0 AND ring_epoch IS NULL THEN
+        RAISE EXCEPTION 'topic.produce_check: producer % has no state on %.% band %, and sent sequence %, not 0',
+            produce_check.producer_id, produce_check.schema_name, produce_check.topic, produce_check.band, first_seq
+            USING ERRCODE = 'PT004';
+    END IF;
+    IF (cardinality(ring) > 0 AND newest IS NULL) OR (cardinality(ring) = 0 AND first_seq <> 0) THEN
         RAISE EXCEPTION 'topic.produce_check: producer % sent sequence % on %.% band %, which is not the next sequence',
             produce_check.producer_id, first_seq, produce_check.schema_name, produce_check.topic, produce_check.band
             USING ERRCODE = 'PT002';
@@ -926,7 +940,8 @@ BEGIN
     IF NOT FOUND THEN
         RETURN 'UNKNOWN_MEMBER_ID';
     END IF;
-    IF NOT coalesce(pg_has_role(topic.caller(), to_regrole(quote_ident(g.owner_role)), 'USAGE'), false) THEN
+    IF NOT coalesce(pg_has_role(topic.caller(), to_regrole(quote_ident(g.owner_role)), 'USAGE'),
+                    (SELECT r.rolsuper FROM pg_roles r WHERE r.rolname = topic.caller()), false) THEN
         RETURN 'GROUP_AUTHORIZATION_FAILED';
     END IF;
     PERFORM FROM topic.topic_groups t WHERE t.group_name = g.group_name FOR UPDATE;
@@ -1208,8 +1223,6 @@ DECLARE
     err text;
     n bigint;
     k int;
-    current_generation int;
-    stored bigint;
     readable boolean := queue IS NOT NULL
         AND EXISTS (SELECT FROM topic.topic_config c WHERE c.schema_name = s AND c.topic = t)
         AND has_table_privilege(topic.caller(), queue, 'SELECT');
@@ -1242,19 +1255,12 @@ BEGIN
           AND (g.generation_id = commit_offset.generation OR (commit_offset.generation = -1 AND g.state = 'Empty'))
         ON CONFLICT ON CONSTRAINT topic_offsets_pkey DO UPDATE
         SET committed_offset = EXCLUDED.committed_offset, generation_id = EXCLUDED.generation_id
-        WHERE o.generation_id <= EXCLUDED.generation_id
-          AND (o.committed_offset < EXCLUDED.committed_offset OR commit_offset.generation = -1);
+        WHERE o.generation_id <= EXCLUDED.generation_id;
         GET DIAGNOSTICS k = ROW_COUNT;
     EXCEPTION WHEN foreign_key_violation OR numeric_value_out_of_range THEN
         RETURN 'UNKNOWN_TOPIC_OR_PARTITION';
     END;
     IF k = 1 THEN
-        RETURN 'NONE';
-    END IF;
-    SELECT g.generation_id INTO current_generation FROM topic.topic_groups g WHERE g.group_name = commit_offset.group_name;
-    SELECT o.committed_offset INTO stored FROM topic.topic_offsets o
-    WHERE o.schema_name = s AND o.topic = t AND o.group_name = commit_offset.group_name AND o.band = commit_offset.band;
-    IF current_generation = commit_offset.generation AND stored >= n THEN
         RETURN 'NONE';
     END IF;
     RETURN 'ILLEGAL_GENERATION';
@@ -1314,25 +1320,38 @@ AS $$
 DECLARE
     q record;
 BEGIN
-    FOR q IN
-        SELECT c.schema_name, c.topic, c.band_count,
-               array_agg(pg_get_constraintdef(k.oid)) FILTER (WHERE k.oid IS NOT NULL) AS checks
-        FROM (SELECT DISTINCT d.objid FROM pg_event_trigger_ddl_commands() d
-              WHERE d.classid = 'pg_class'::regclass) d
+    IF EXISTS (
+        SELECT FROM pg_event_trigger_ddl_commands() d
+        JOIN pg_trigger g ON g.tgrelid = d.objid AND g.tgfoid = 'topic.publish_floor()'::regprocedure
         JOIN pg_class r ON r.oid = d.objid
         JOIN pg_namespace n ON n.oid = r.relnamespace
-        JOIN topic.topic_config c ON c.schema_name = n.nspname AND c.topic = r.relname
-        LEFT JOIN pg_attribute a ON a.attrelid = r.oid AND a.attname = 'band'
-        LEFT JOIN pg_constraint k ON k.conrelid = r.oid AND k.contype = 'c' AND a.attnum = ANY (k.conkey)
-        GROUP BY c.schema_name, c.topic, c.band_count
-    LOOP
-        IF q.checks IS DISTINCT FROM ARRAY[format('CHECK (((band >= 0) AND (band <= %s)))', q.band_count - 1)] THEN
-            RAISE WARNING 'topic: the CHECK constraints on band of %.% are %, which do not match band_count %',
-                q.schema_name, q.topic, q.checks, q.band_count;
-        END IF;
-    END LOOP;
-EXCEPTION WHEN OTHERS THEN
-    RAISE WARNING 'topic: the % event trigger failed on %: %', TG_EVENT, TG_TAG, SQLERRM;
+        WHERE d.classid = 'pg_class'::regclass
+          AND NOT EXISTS (SELECT FROM topic.topic_config c WHERE c.schema_name = n.nspname AND c.topic = r.relname))
+    THEN
+        RAISE EXCEPTION 'topic: a queue table must keep its name and schema'
+            USING HINT = 'Make a new topic with topic.create_topic, and drop the old one with topic.drop_topic.';
+    END IF;
+    BEGIN
+        FOR q IN
+            SELECT c.schema_name, c.topic, c.band_count,
+                   array_agg(pg_get_constraintdef(k.oid)) FILTER (WHERE k.oid IS NOT NULL) AS checks
+            FROM (SELECT DISTINCT d.objid FROM pg_event_trigger_ddl_commands() d
+                  WHERE d.classid = 'pg_class'::regclass) d
+            JOIN pg_class r ON r.oid = d.objid
+            JOIN pg_namespace n ON n.oid = r.relnamespace
+            JOIN topic.topic_config c ON c.schema_name = n.nspname AND c.topic = r.relname
+            LEFT JOIN pg_attribute a ON a.attrelid = r.oid AND a.attname = 'band'
+            LEFT JOIN pg_constraint k ON k.conrelid = r.oid AND k.contype = 'c' AND a.attnum = ANY (k.conkey)
+            GROUP BY c.schema_name, c.topic, c.band_count
+        LOOP
+            IF q.checks IS DISTINCT FROM ARRAY[format('CHECK (((band >= 0) AND (band <= %s)))', q.band_count - 1)] THEN
+                RAISE WARNING 'topic: the CHECK constraints on band of %.% are %, which do not match band_count %',
+                    q.schema_name, q.topic, q.checks, q.band_count;
+            END IF;
+        END LOOP;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'topic: the % event trigger failed on %: %', TG_EVENT, TG_TAG, SQLERRM;
+    END;
 END
 $$;
 
@@ -1557,6 +1576,7 @@ SELECT pg_catalog.pg_extension_config_dump('topic.producer_id_seq', '');
 SELECT pg_catalog.pg_extension_config_dump('topic.producer_ids', '');
 GRANT SELECT ON topic.topic_groups, topic.topic_group_members, topic.topic_offsets TO PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.stamp_topic(text, text, int) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION topic.raise_synchronous_commit(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.retention_check(oid) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.retention_floor(text, text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION topic.ensure_partitions(text, text, int) FROM PUBLIC;
