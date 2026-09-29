@@ -48,7 +48,7 @@ traffic=$!
 wait_for "[ \"\$(psql_as postgres 'SELECT count(*) > 100 FROM alice.r_q')\" = t ]"
 old=$(listener_pid)
 kill -9 "$old"
-wait_for "[[ \"\$(listener_pid)\" =~ ^[0-9]+\$ ]] && [ \"\$(listener_pid)\" != '$old' ] && [ \"\$(listener_status)\" = 'listening on port $KPORT' ]"
+wait_for "p=\$(listener_pid); [[ \"\$p\" =~ ^[0-9]+\$ ]] && [ \"\$p\" != '$old' ] && [ \"\$(listener_status)\" = 'listening on port $KPORT' ]"
 chk "the cluster recovers after kill -9 of the listener worker" "listening on port $KPORT" "$(listener_status)"
 wait "$traffic"
 grep -v "^cb " "$WORK/traffic.out" || true

@@ -56,8 +56,9 @@ chk "a LISTEN session gets pg_topics_stamped" yes \
 
 old=$(stamper_pid)
 kill -9 "$old"
-wait_for "[[ \"\$(stamper_pid)\" =~ ^[0-9]+\$ ]] && [ \"\$(stamper_pid)\" != $old ]"
-chk "the stamper restarts after kill -9" yes "$([[ "$(stamper_pid)" =~ ^[0-9]+$ ]] && [ "$(stamper_pid)" != "$old" ] && echo yes || echo no)"
+wait_for "p=\$(stamper_pid); [[ \"\$p\" =~ ^[0-9]+\$ ]] && [ \"\$p\" != $old ]"
+new=$(stamper_pid)
+chk "the stamper restarts after kill -9" yes "$([[ "$new" =~ ^[0-9]+$ ]] && [ "$new" != "$old" ] && echo yes || echo no)"
 publish_1000
 chk "the new stamper gives 1000 more rows an offset within 2 s" yes "$(stamped_within_ms 2000)"
 chk "the offsets still have no gap and no duplicate" t "$(gap_free a_q b_q c_q)"
