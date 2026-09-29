@@ -75,6 +75,7 @@ new_cluster() {
   PGBIN=$("$PG_CONFIG" --bindir)
   PORT=$(free_port)
   WORK=$(mktemp -d)
+  chmod 755 "$WORK"
   PGDATA="$WORK/data"
   trap cleanup EXIT
   (cd "$HERE/../extension" && cargo pgrx install --pg-config "$PG_CONFIG" >/dev/null)
