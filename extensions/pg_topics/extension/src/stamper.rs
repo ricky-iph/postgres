@@ -146,7 +146,7 @@ fn stamp(schema_name: &str, topic: &str, max_rows: i32, skip_locked: bool) -> sp
     )?;
     beat(backlog)?;
 
-    if total > 0 {
+    if total > 0 && !skip_locked {
         Spi::run_with_args(
             "SELECT pg_catalog.pg_notify('pg_topics_stamped', $1 || '.' || $2)",
             Some(names()),
@@ -189,7 +189,23 @@ fn stamp_locked(schema_name: &str, topic: &str) -> spi::Result<i32> {
 #[no_mangle]
 #[pg_guard]
 pub extern "C" fn pg_topics_stamper_main(_arg: pg_sys::Datum) {
-    topic_worker("stamper", "true", stamp_locked)
+    topic_worker(
+        "stamper",
+        "min_durability <> 'replicated'",
+        stamp_locked,
+        true,
+    )
+}
+
+#[no_mangle]
+#[pg_guard]
+pub extern "C" fn pg_topics_replicated_stamper_main(_arg: pg_sys::Datum) {
+    topic_worker(
+        "replicated stamper",
+        "min_durability = 'replicated'",
+        stamp_locked,
+        true,
+    )
 }
 
 #[cfg(any(test, feature = "pg_test"))]

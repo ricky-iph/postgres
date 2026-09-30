@@ -53,7 +53,7 @@ A band is a Kafka partition.
 
 ## The stamper
 
-One stamper worker gives out offsets for every topic in its database, one topic after another. It limits the publish throughput.
+One stamper worker gives out offsets for every topic in its database, one topic after another. A second stamper does the same for the replicated topics. Their commits wait for the synchronous standbys to apply, so a slow standby holds back only those topics. The stamper limits the publish throughput.
 
 | Load, SQL, 100 rows a transaction, 8 clients | Published | Stamped while publishing | Backlog left, cleared after | Largest `backlog_age` |
 |---|---:|---:|---:|---:|

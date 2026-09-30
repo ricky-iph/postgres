@@ -297,7 +297,7 @@ fn wait_latch(ms: i64) -> bool {
     !BackgroundWorker::sigterm_received()
 }
 
-fn topic_worker(worker: &str, filter: &str, work: fn(&str, &str) -> spi::Result<i32>) {
+fn topic_worker(worker: &str, filter: &str, work: fn(&str, &str) -> spi::Result<i32>, wake: bool) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some(BackgroundWorker::get_extra()), None);
     in_transaction(|| {
@@ -329,6 +329,9 @@ fn topic_worker(worker: &str, filter: &str, work: fn(&str, &str) -> spi::Result<
                 Some(n) => {
                     if n > 0 {
                         worked.insert(key.clone(), Instant::now());
+                        if wake {
+                            guarded(worker, || in_transaction(|| notify_stamped(&key.0, &key.1)));
+                        }
                     }
                     retry_after.remove(key);
                 }
@@ -343,16 +346,30 @@ fn topic_worker(worker: &str, filter: &str, work: fn(&str, &str) -> spi::Result<
     unsafe { pg_sys::proc_exit(1) }
 }
 
+fn notify_stamped(schema_name: &str, topic: &str) -> spi::Result<()> {
+    // NOTIFY holds a cluster-wide lock until commit ends, so it must not share a commit that waits on a standby.
+    Spi::run("SET LOCAL synchronous_commit = off")?;
+    Spi::run_with_args(
+        "SELECT pg_catalog.pg_notify('pg_topics_stamped', $1 || '.' || $2)",
+        Some(vec![text_arg(schema_name), text_arg(topic)]),
+    )
+}
+
 #[no_mangle]
 #[pg_guard]
 pub extern "C" fn pg_topics_sync_main(_arg: pg_sys::Datum) {
-    topic_worker("sync worker", "sync_enabled", |schema_name, topic| {
-        Ok(read_one::<i32>(
-            "SELECT topic.sync_topic($1, $2)",
-            vec![text_arg(schema_name), text_arg(topic)],
-        )?
-        .unwrap_or(0))
-    })
+    topic_worker(
+        "sync worker",
+        "sync_enabled",
+        |schema_name, topic| {
+            Ok(read_one::<i32>(
+                "SELECT topic.sync_topic($1, $2)",
+                vec![text_arg(schema_name), text_arg(topic)],
+            )?
+            .unwrap_or(0))
+        },
+        false,
+    )
 }
 
 #[pg_guard]
@@ -477,6 +494,14 @@ pub extern "C" fn _PG_init() {
             .set_type("pg_topics stamper")
             .set_library("pg_topics")
             .set_function("pg_topics_stamper_main")
+            .set_extra(database)
+            .set_restart_time(Some(Duration::from_secs(5)))
+            .enable_spi_access()
+            .load();
+        BackgroundWorkerBuilder::new(&format!("pg_topics replicated stamper {database}"))
+            .set_type("pg_topics replicated stamper")
+            .set_library("pg_topics")
+            .set_function("pg_topics_replicated_stamper_main")
             .set_extra(database)
             .set_restart_time(Some(Duration::from_secs(5)))
             .enable_spi_access()

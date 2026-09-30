@@ -31,6 +31,10 @@ set_standbys() {
   chk "pg_stat_replication shows $2 under $1" "$2" "$(sync_standbys)"
 }
 
+stampers_on_syncrep() {
+  on "$P1" postgres "SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'SyncRep' AND backend_type LIKE 'pg_topics %'"
+}
+
 rf() {
   kafka_py alice alice-pw describe_config_sources "$1" | awk '$2 == "pg_topics.replication_factor" {print $3}'
 }
@@ -80,11 +84,26 @@ timeout 5 "$PGBIN/psql" -h /tmp -p "$P1" -U alice -d postgres -tAq -c "SET state
   -c "SELECT topic.publish('alice.rf3_q', '{\"sql\": \"paused\"}')" >/dev/null 2>&1 || sql_exit=$?
 chk "a SQL publish does not return while s2 pauses replay" 124 "$sql_exit"
 chk "both publishers wait on SyncRep while s2 pauses replay" 2 \
-  "$(on "$P1" postgres "SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'SyncRep'")"
+  "$(on "$P1" postgres "SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'SyncRep' AND backend_type = 'client backend'")"
 on "$S2" postgres "SELECT pg_wal_replay_resume()" >/dev/null
 wait_for "[ \"\$(on_standbys 'SELECT count(*) FROM alice.rf3_q')\" = '67 67' ]" || true
 chk "the two waiting records commit on both standbys after s2 resumes replay" "67 67" \
   "$(on_standbys "SELECT count(*) FROM alice.rf3_q")"
+
+on "$P1" postgres "SELECT topic.create_topic('public.relaxed_q', 1, min_durability => 'relaxed')" >/dev/null
+hold_stamp_lock alice.rf3_q
+on "$P1" alice "SELECT topic.publish('alice.rf3_q', jsonb_build_object('held', i)) FROM generate_series(1, 3) i" >/dev/null
+on "$S2" postgres "SELECT pg_wal_replay_pause()" >/dev/null
+release_stamp_lock
+wait_for "[ \"\$(stampers_on_syncrep)\" = 1 ]" || true
+chk "a stamper waits on SyncRep for the replicated topic while s2 pauses replay" 1 "$(stampers_on_syncrep)"
+on "$P1" postgres "SELECT topic.publish('public.relaxed_q', jsonb_build_object('i', i)) FROM generate_series(1, 5) i" >/dev/null
+wait_for "[ \"\$(unstamped public.relaxed_q)\" = 0 ]" || true
+echo "RED: a relaxed topic while the replicated stamper waits on s2 -- $(unstamped public.relaxed_q) unstamped"
+chk "a relaxed topic is still stamped while the replicated topic waits on s2" 0 "$(unstamped public.relaxed_q)"
+on "$S2" postgres "SELECT pg_wal_replay_resume()" >/dev/null
+wait_for "[ \"\$(unstamped alice.rf3_q)\" = 0 ]" || true
+chk "the replicated topic is stamped after s2 resumes replay" 0 "$(unstamped alice.rf3_q)"
 
 set_standbys 'ANY 1 (s1, s2)' 's1:quorum s2:quorum'
 out=$(kafka_py alice alice-pw create_topic alice.rf3b_q 1 3)

@@ -147,7 +147,8 @@ factor of 3.
 ### The stamper and the table sync
 
 The stamper is the worker that gives each record its offset. One stamper
-serves every topic in a database.
+serves every topic in a database, and a second one serves its replicated
+topics, so a slow standby cannot hold back the other topics.
 
 | Test | Result |
 |---|---|
@@ -193,7 +194,8 @@ monitoring views and the alert rules are in [Operate](docs/operations.md).
 
 - One primary does all the writes. Publish throughput does not grow with
   more machines. Standbys give failover and SQL history reads.
-- One stamper for each database gives out offsets for every topic in it,
+- One stamper for each database gives out offsets for every topic in it
+  that is not replicated, and a second one for the replicated topics,
   at about 70,000 to 100,000 records a second on the test machine.
 - The stamper gives offsets to committed records, so offsets follow commit
   order as the stamper sees it. When one stamper pass sees several

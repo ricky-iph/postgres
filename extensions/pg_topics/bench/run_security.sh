@@ -348,7 +348,7 @@ chk "lint: no role has BYPASSRLS but the bootstrap superuser" postgres \
 chk "lint: no SECURITY DEFINER function is owned by a NOLOGIN role" "" \
   "$(psql_as postgres "SELECT string_agg(p.oid::regprocedure::text, ',') FROM pg_proc p
      JOIN pg_roles r ON r.oid = p.proowner WHERE p.prosecdef AND NOT r.rolcanlogin")"
-chk "lint: the four workers connect as the bootstrap superuser" "4|postgres" \
+chk "lint: the five workers connect as the bootstrap superuser" "5|postgres" \
   "$(psql_as postgres "SELECT count(*) || '|' || string_agg(DISTINCT usename, ',') FROM pg_stat_activity
      WHERE backend_type LIKE 'pg_topics %'")"
 

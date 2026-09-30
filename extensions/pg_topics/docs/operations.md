@@ -69,6 +69,7 @@ Each worker writes to the PostgreSQL log. Each line starts with a fixed text:
 | `pg_topics partition worker:` | Partition creation, retention and the hourly duplicate check |
 | `pg_topics sync worker:` | The table sync |
 | `pg_topics stamper:` | An error in the stamper |
+| `pg_topics replicated stamper:` | An error in the stamper of the replicated topics |
 | `topic.stamp_topic:` | The stamper saw a changed `stamped_by`, for example after a promotion |
 
 Each worker restarts 5 seconds after it stops.
@@ -112,10 +113,11 @@ Each worker restarts 5 seconds after it stops.
 
 ### The backlog grows
 
-The stamper gives out offsets for every topic in the database, one topic after another. When `backlog_age` grows:
+The stamper gives out offsets for every topic in the database, one topic after another. The replicated stamper does the same for the replicated topics. When `backlog_age` grows:
 
 1. Check that the stamper runs:
-   `SELECT * FROM pg_stat_activity WHERE backend_type = 'pg_topics stamper';`
+   `SELECT * FROM pg_stat_activity WHERE backend_type IN ('pg_topics stamper', 'pg_topics replicated stamper');`
+   A replicated stamper with `wait_event` `SyncRep` waits for a standby to apply its commit.
 2. Check for a lock on the topic's band rows in `pg_locks`.
 3. Compare the publish rate with the stamper limits in
    [Tune](tuning.md#the-stamper).

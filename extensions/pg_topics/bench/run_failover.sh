@@ -83,9 +83,9 @@ fork=$(offsets "$P2")
 echo "next_offset per band at the fork: $fork"
 "$PGBIN/pg_ctl" -D "$D2" -w promote >/dev/null
 chk "the promoted standby left recovery" f "$(on "$P2" postgres "SELECT pg_is_in_recovery()")"
-wait_for "[ \"\$(workers $P2)\" = 'pg_topics listener,pg_topics partition,pg_topics stamper,pg_topics sync' ]" || true
-chk "the four workers start on the new primary after promotion" \
-  "pg_topics listener,pg_topics partition,pg_topics stamper,pg_topics sync" "$(workers "$P2")"
+wait_for "[ \"\$(workers $P2)\" = 'pg_topics listener,pg_topics partition,pg_topics replicated stamper,pg_topics stamper,pg_topics sync' ]" || true
+chk "the five workers start on the new primary after promotion" \
+  "pg_topics listener,pg_topics partition,pg_topics replicated stamper,pg_topics stamper,pg_topics sync" "$(workers "$P2")"
 PORT=$P2 wait_for "[ \"\$(listener_status)\" = 'listening on port $K2' ]" || true
 chk "the new primary listener binds its own port after promotion" "listening on port $K2" "$(PORT=$P2 listener_status)"
 chk "the old primary listener still holds its port" "listening on port $K1" "$(PORT=$P1 listener_status)"

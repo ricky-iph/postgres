@@ -48,7 +48,7 @@ pg_topics.failover_is_fenced = on
 - `pg_topics.databases` is a comma list of the databases that hold topics. Replace `app` with your own database name. Name only databases that exist. A missing database makes its workers restart every 5 seconds.
 - `pg_topics.failover_is_fenced = on` is your promise that the old primary stops before a standby takes over. The default durability tier needs it. Read [Durability and failover](configuration.md#durability-tiers) before you set it.
 
-Each database in `pg_topics.databases` starts 4 background workers. They are the stamper, the partition worker, the sync worker and the Kafka listener. Check that `max_worker_processes` has room for them:
+Each database in `pg_topics.databases` starts 5 background workers. They are the stamper, the replicated stamper, the partition worker, the sync worker and the Kafka listener. Check that `max_worker_processes` has room for them:
 
 ```ini
 max_worker_processes = 16
@@ -142,13 +142,13 @@ The extension puts all its objects in a schema named `topic`. The install stops 
 
 ## 7. Check that it works
 
-Check that the 4 workers run:
+Check that the 5 workers run:
 
 ```sql
 SELECT backend_type FROM pg_stat_activity WHERE backend_type LIKE 'pg_topics %';
 ```
 
-You see `pg_topics stamper`, `pg_topics partition`, `pg_topics sync` and `pg_topics listener`.
+You see `pg_topics stamper`, `pg_topics replicated stamper`, `pg_topics partition`, `pg_topics sync` and `pg_topics listener`.
 
 Check that the listener has its port:
 

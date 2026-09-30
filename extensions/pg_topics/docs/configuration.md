@@ -18,7 +18,7 @@ Only a superuser can change these settings.
 
 | Setting | Default | Takes effect | Meaning |
 |---|---|---|---|
-| `pg_topics.databases` | empty | Restart | A comma list of the databases that get the 4 workers. |
+| `pg_topics.databases` | empty | Restart | A comma list of the databases that get the 5 workers. |
 | `pg_topics.failover_is_fenced` | `off` | Reload | Your promise that the old primary is stopped before a standby takes over. pg_topics does not check it. A topic cannot use the `durable` or `replicated` tier while this is `off`. |
 | `pg_topics.port` | `9092` | Listener restart | The TCP port of the Kafka listener. `0` means no listener. Set it per database with `ALTER DATABASE`. |
 | `pg_topics.advertised_host` | `localhost` | Listener restart | The host name that `Metadata` gives to Kafka clients. Clients reconnect to this name. |
@@ -51,7 +51,7 @@ The listener binds its port on every IPv4 address of the host. Use a firewall to
 | PostgreSQL setting | What to set |
 |---|---|
 | `shared_preload_libraries` | Must include `pg_topics`. Restart. |
-| `max_worker_processes` | At least 4 for each database in `pg_topics.databases`, plus what the rest of the server uses. |
+| `max_worker_processes` | At least 5 for each database in `pg_topics.databases`, plus what the rest of the server uses. |
 | `max_connections` | Above `pg_topics.max_clients`, plus your other clients. Each Kafka client holds one connection. |
 | `synchronous_standby_names` | Needed only for the `replicated` tier. See [Replication factor](#replication-factor). |
 | `pg_hba.conf` | A `local` line for the bootstrap superuser, and a password line for `127.0.0.1/32`. See [Install](install.md#3-let-the-workers-connect). |
@@ -336,11 +336,11 @@ A physical backup or a replica has no such problem.
 
 A streaming standby keeps a full copy of every topic.
 
-- The 4 workers do not run on a standby while it is in recovery. Its listener port stays closed.
+- The 5 workers do not run on a standby while it is in recovery. Its listener port stays closed.
 - A normal role can read a topic on a standby with `topic.fetch` and `topic.band_offsets`. This moves history reads off the primary.
 - `ALTER DATABASE ... SET pg_topics.port` replicates. A standby on the same host as the primary must set its own `pg_topics.port` in its own `postgresql.conf`.
 
-When you promote a standby, its 4 workers start and its listener opens its port. Each band continues from the replicated `next_offset`.
+When you promote a standby, its 5 workers start and its listener opens its port. Each band continues from the replicated `next_offset`.
 
 For failover:
 
@@ -354,4 +354,4 @@ Warning: if the old primary still takes writes after the promotion, both nodes g
 
 ## More than one database
 
-Each database in `pg_topics.databases` has its own 4 workers, its own listener and its own port. A topic belongs to one database. A Kafka client connection sees only the topics of the database whose port it uses. Roles are shared by the whole server, and grants are per database.
+Each database in `pg_topics.databases` has its own 5 workers, its own listener and its own port. A topic belongs to one database. A Kafka client connection sees only the topics of the database whose port it uses. Roles are shared by the whole server, and grants are per database.
